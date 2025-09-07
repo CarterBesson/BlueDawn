@@ -1,0 +1,274 @@
+import Foundation
+
+struct MastodonClient: SocialClient {
+    let baseURL: URL // e.g., https://mastodon.social
+    let accessToken: String
+
+    // MARK: Home timeline
+    func fetchHomeTimeline(cursor: String?) async throws -> (posts: [UnifiedPost], nextCursor: String?) {
+        guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw URLError(.badURL)
+        }
+        comps.path = "/api/v1/timelines/home"
+        var items: [URLQueryItem] = [URLQueryItem(name: "limit", value: "40")]
+        if let cursor = cursor { items.append(URLQueryItem(name: "max_id", value: cursor)) }
+        comps.queryItems = items
+        guard let url = comps.url else { throw URLError(.badURL) }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+
+        let statuses = try JSONDecoder().decode([MastoStatus].self, from: data)
+        let mapped = statuses.map { mapStatusToUnified($0) }
+        let nextCursor = statuses.last?.id
+        return (mapped, nextCursor)
+    }
+
+    // MARK: Thread replies (descendants)
+    func fetchThread(root post: UnifiedPost) async throws -> [ThreadItem] {
+        // post.id like "mastodon:<id>"
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return [] }
+        var url = baseURL
+        url.append(path: "/api/v1/statuses/\(id)/context")
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+
+        let context = try JSONDecoder().decode(Context.self, from: data)
+
+        // build id -> status for depth calculation
+        let all = context.descendants
+        var byID: [String: MastoStatus] = [:]
+        for s in all { byID[s.id] = s }
+
+        func depth(for s: MastoStatus) -> Int {
+            var d = 1
+            var parent = s.in_reply_to_id
+            var guardCounter = 0
+            while let pid = parent, pid != id, guardCounter < 32 {
+                if let p = byID[pid] { d += 1; parent = p.in_reply_to_id } else { break }
+                guardCounter += 1
+            }
+            return d
+        }
+
+        let sorted = all.sorted { parseISO8601($0.created_at) ?? .distantPast < parseISO8601($1.created_at) ?? .distantPast }
+        return sorted.map { s in
+            let u = mapStatusToUnified(s)
+            return ThreadItem(id: u.id, post: u, depth: depth(for: s))
+        }
+    }
+
+    // MARK: Thread ancestors (parents)
+    func fetchAncestors(root post: UnifiedPost) async throws -> [UnifiedPost] {
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return [] }
+        var url = baseURL
+        url.append(path: "/api/v1/statuses/\(id)/context")
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+
+        let context = try JSONDecoder().decode(Context.self, from: data)
+        let sorted = context.ancestors.sorted { parseISO8601($0.created_at) ?? .distantPast < parseISO8601($1.created_at) ?? .distantPast }
+        return sorted.map { mapStatusToUnified($0) }
+    }
+
+    func like(post: UnifiedPost) async throws { /* TODO: POST /api/v1/statuses/:id/favourite */ }
+    func repost(post: UnifiedPost) async throws { /* TODO: POST /api/v1/statuses/:id/reblog */ }
+    func reply(to post: UnifiedPost, text: String) async throws { /* TODO: POST /api/v1/statuses */ }
+
+    // MARK: - Profile
+    func fetchUserProfile(handle: String) async throws -> UnifiedUser {
+        let acct = try await lookupAccount(handle: handle)
+        let bio = htmlToAttributed(acct.note ?? "")
+        return UnifiedUser(
+            id: "mastodon:\(acct.id)",
+            network: .mastodon(instance: baseURL.host ?? baseURL.absoluteString),
+            handle: acct.acct,
+            displayName: acct.display_name.isEmpty ? nil : acct.display_name,
+            avatarURL: URL(string: acct.avatar),
+            bio: bio,
+            followersCount: acct.followers_count,
+            followingCount: acct.following_count,
+            postsCount: acct.statuses_count
+        )
+    }
+
+    // MARK: - Author feed
+    func fetchAuthorFeed(handle: String, cursor: String?) async throws -> (posts: [UnifiedPost], nextCursor: String?) {
+        let acct = try await lookupAccount(handle: handle)
+
+        guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw URLError(.badURL) }
+        comps.path = "/api/v1/accounts/\(acct.id)/statuses"
+        var items: [URLQueryItem] = [URLQueryItem(name: "limit", value: "40")]
+        if let cursor = cursor { items.append(URLQueryItem(name: "max_id", value: cursor)) }
+        comps.queryItems = items
+        guard let url = comps.url else { throw URLError(.badURL) }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+
+        let statuses = try JSONDecoder().decode([MastoStatus].self, from: data)
+        let mapped = statuses.map { mapStatusToUnified($0) }
+        let next = statuses.last?.id
+        return (mapped, next)
+    }
+
+    // Helper to resolve an account by handle
+    private func lookupAccount(handle: String) async throws -> Account {
+        guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw URLError(.badURL) }
+        comps.path = "/api/v1/accounts/lookup"
+        comps.queryItems = [ URLQueryItem(name: "acct", value: handle) ]
+        guard let url = comps.url else { throw URLError(.badURL) }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+
+        return try JSONDecoder().decode(Account.self, from: data)
+    }
+
+    // MARK: - Mapping helpers
+    private func mapStatusToUnified(_ s: MastoStatus) -> UnifiedPost {
+        // Prefer the boosted/original content when this status is a reblog
+        let src = s.reblog ?? MastoReblog(
+            id: s.id,
+            created_at: s.created_at,
+            in_reply_to_id: s.in_reply_to_id,
+            sensitive: s.sensitive,
+            spoiler_text: s.spoiler_text,
+            content: s.content,
+            account: s.account,
+            media_attachments: s.media_attachments
+        )
+
+        let created = parseISO8601(src.created_at) ?? Date()
+        let text = htmlToAttributed(src.content)
+        let media: [Media] = src.media_attachments.compactMap { att in
+            let kind: Media.Kind
+            switch att.type {
+            case "image": kind = .image
+            case "video": kind = .video
+            case "gifv":  kind = .gif
+            default:       kind = .image
+            }
+            guard let u = URL(string: att.url) ?? (att.preview_url.flatMap(URL.init(string:))) else { return nil }
+            return Media(url: u, altText: att.description, kind: kind)
+        }
+        let cwLabels: [UnifiedPost.CWOrLabel]? = {
+            var arr: [UnifiedPost.CWOrLabel] = []
+            if let spoiler = src.spoiler_text, !spoiler.isEmpty { arr.append(.cw(spoiler)) }
+            if src.sensitive == true { arr.append(.label("sensitive")) }
+            return arr.isEmpty ? nil : arr
+        }()
+
+        return UnifiedPost(
+            id: "mastodon:\(src.id)",
+            network: .mastodon(instance: baseURL.host ?? baseURL.absoluteString),
+            authorHandle: src.account.acct,
+            authorDisplayName: src.account.display_name.isEmpty ? nil : src.account.display_name,
+            authorAvatarURL: URL(string: src.account.avatar),
+            createdAt: created,
+            text: text,
+            media: media,
+            cwOrLabels: cwLabels,
+            counts: PostCounts(replies: s.replies_count, boostsReposts: s.reblogs_count, favLikes: s.favourites_count),
+            inReplyToID: src.in_reply_to_id,
+            isRepostOrBoost: s.reblog != nil
+        )
+    }
+
+    // very light HTML→plain text conversion (avoids UIKit dependency)
+    private func htmlToAttributed(_ html: String) -> AttributedString {
+        let withBreaks = html.replacingOccurrences(of: "<br ?/?>", with: "\n", options: .regularExpression)
+        let stripped = withBreaks.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+        return AttributedString(stripped)
+    }
+
+    private func parseISO8601(_ s: String) -> Date? {
+        let f1 = ISO8601DateFormatter(); f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let f2 = ISO8601DateFormatter(); f2.formatOptions = [.withInternetDateTime]
+        return f1.date(from: s) ?? f2.date(from: s)
+    }
+
+    // MARK: - API models
+    private enum APIError: Error { case badStatus(Int) }
+
+    private struct Context: Decodable { let ancestors: [MastoStatus]; let descendants: [MastoStatus] }
+
+    private struct MastoStatus: Decodable {
+        let id: String
+        let created_at: String
+        let in_reply_to_id: String?
+        let sensitive: Bool?
+        let spoiler_text: String?
+        let content: String
+        let account: Account
+        let media_attachments: [MediaAttachment]
+        let reblog: MastoReblog?
+        let replies_count: Int?
+        let reblogs_count: Int?
+        let favourites_count: Int?
+    }
+
+    private struct Account: Decodable {
+        let id: String
+        let acct: String
+        let display_name: String
+        let avatar: String
+        let note: String?
+        let followers_count: Int?
+        let following_count: Int?
+        let statuses_count: Int?
+    }
+
+    private struct MastoReblog: Decodable {
+        let id: String
+        let created_at: String
+        let in_reply_to_id: String?
+        let sensitive: Bool?
+        let spoiler_text: String?
+        let content: String
+        let account: Account
+        let media_attachments: [MediaAttachment]
+    }
+
+    private struct MediaAttachment: Decodable { let id: String; let type: String; let url: String; let preview_url: String?; let description: String? }
+}
