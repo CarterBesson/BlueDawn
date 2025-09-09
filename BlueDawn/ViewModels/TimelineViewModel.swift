@@ -40,27 +40,45 @@ final class TimelineViewModel {
         error = nil
         defer { isLoading = false }
 
-        do {
-            async let m: Void = fetchMastodon(resetCursor: true)
-            async let b: Void = fetchBluesky(resetCursor: true)
-            _ = try await (m, b)
-            applyFilter()
-        } catch {
-            if case BlueskyClient.APIError.badStatus(let code, _) = error, code == 401 {
-                if await session.refreshBlueskyIfNeeded() {
-                    // Retry once with fresh token
-                    do {
-                        async let m: Void = fetchMastodon(resetCursor: true)
-                        async let b: Void = fetchBluesky(resetCursor: true)
-                        _ = try await (m, b)
-                        applyFilter()
-                        return
-                    } catch { /* fall through to show error */ }
-                } else {
-                    session.signOutBluesky()
-                }
+        func fetchMastodonWrapper() async -> Result<Void, Error> {
+            do {
+                try await fetchMastodon(resetCursor: true)
+                return .success(())
+            } catch {
+                return .failure(error)
             }
-            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+
+        func fetchBlueskyWrapper() async -> Result<Void, Error> {
+            do {
+                try await fetchBluesky(resetCursor: true)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+
+        let mResult = await fetchMastodonWrapper()
+        var bResult = await fetchBlueskyWrapper()
+
+        if case .failure(let bError) = bResult,
+           case BlueskyClient.APIError.badStatus(let code, _) = bError, code == 401 {
+            if await session.refreshBlueskyIfNeeded() {
+                do {
+                    try await fetchBluesky(resetCursor: true)
+                    bResult = .success(())
+                } catch {
+                    bResult = .failure(error)
+                }
+            } else {
+                session.signOutBluesky()
+            }
+        }
+
+        applyFilter()
+
+        if case .failure(let mError) = mResult, case .failure(let bError) = bResult {
+            self.error = (bError as? LocalizedError)?.errorDescription ?? bError.localizedDescription
         }
     }
 
@@ -76,27 +94,45 @@ final class TimelineViewModel {
         error = nil
         defer { isLoadingMore = false }
 
-        do {
-            async let m: Void = fetchMastodon(resetCursor: false)
-            async let b: Void = fetchBluesky(resetCursor: false)
-            _ = try await (m, b)
-            applyFilter()
-        } catch {
-            if case BlueskyClient.APIError.badStatus(let code, _) = error, code == 401 {
-                if await session.refreshBlueskyIfNeeded() {
-                    // Retry once with fresh token
-                    do {
-                        async let m: Void = fetchMastodon(resetCursor: false)
-                        async let b: Void = fetchBluesky(resetCursor: false)
-                        _ = try await (m, b)
-                        applyFilter()
-                        return
-                    } catch { /* fall through */ }
-                } else {
-                    session.signOutBluesky()
-                }
+        func fetchMastodonWrapper() async -> Result<Void, Error> {
+            do {
+                try await fetchMastodon(resetCursor: false)
+                return .success(())
+            } catch {
+                return .failure(error)
             }
-            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+
+        func fetchBlueskyWrapper() async -> Result<Void, Error> {
+            do {
+                try await fetchBluesky(resetCursor: false)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+
+        let mResult = await fetchMastodonWrapper()
+        var bResult = await fetchBlueskyWrapper()
+
+        if case .failure(let bError) = bResult,
+           case BlueskyClient.APIError.badStatus(let code, _) = bError, code == 401 {
+            if await session.refreshBlueskyIfNeeded() {
+                do {
+                    try await fetchBluesky(resetCursor: false)
+                    bResult = .success(())
+                } catch {
+                    bResult = .failure(error)
+                }
+            } else {
+                session.signOutBluesky()
+            }
+        }
+
+        applyFilter()
+
+        if case .failure(let mError) = mResult, case .failure(let bError) = bResult {
+            self.error = (bError as? LocalizedError)?.errorDescription ?? bError.localizedDescription
         }
     }
 
