@@ -177,7 +177,7 @@ struct MastodonClient: SocialClient {
         )
 
         let created = parseISO8601(src.created_at) ?? Date()
-        let text = htmlToAttributed(src.content)
+        let text: AttributedString = HTML.toAttributed(src.content)
         let media: [Media] = src.media_attachments.compactMap { att in
             let kind: Media.Kind
             switch att.type {

@@ -77,7 +77,7 @@ final class TimelineViewModel {
 
         applyFilter()
 
-        if case .failure(let mError) = mResult, case .failure(let bError) = bResult {
+        if case .failure = mResult, case .failure(let bError) = bResult {
             self.error = (bError as? LocalizedError)?.errorDescription ?? bError.localizedDescription
         }
     }
@@ -131,7 +131,7 @@ final class TimelineViewModel {
 
         applyFilter()
 
-        if case .failure(let mError) = mResult, case .failure(let bError) = bResult {
+        if case .failure = mResult, case .failure(let bError) = bResult {
             self.error = (bError as? LocalizedError)?.errorDescription ?? bError.localizedDescription
         }
     }
