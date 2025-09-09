@@ -12,19 +12,13 @@ struct BlueskyClient: SocialClient {
         comps?.queryItems = items
 
         guard let url = comps?.url else { throw URLError(.badURL) }
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
-        }
+        let data = try await performGET(url)
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let tl = try decoder.decode(GetTimelineResponse.self, from: data)
+        let tl: GetTimelineResponse
+        do { tl = try decoder.decode(GetTimelineResponse.self, from: data) }
+        catch let e as DecodingError { throw APIError.decoding(e) }
 
         let mapped = tl.feed.compactMap { feedItem -> UnifiedPost? in
             let p = feedItem.post
@@ -47,18 +41,12 @@ struct BlueskyClient: SocialClient {
         ]
         guard let url = comps?.url else { throw URLError(.badURL) }
 
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
-        }
+        let data = try await performGET(url)
 
         let decoder = JSONDecoder()
-        let rootResp = try decoder.decode(GetPostThreadResponse.self, from: data)
+        let rootResp: GetPostThreadResponse
+        do { rootResp = try decoder.decode(GetPostThreadResponse.self, from: data) }
+        catch let e as DecodingError { throw APIError.decoding(e) }
 
         var items: [ThreadItem] = []
         if case let .threadViewPost(node) = rootResp.thread {
@@ -75,18 +63,12 @@ struct BlueskyClient: SocialClient {
         comps?.queryItems = [ URLQueryItem(name: "uri", value: uri) ]
         guard let url = comps?.url else { throw URLError(.badURL) }
 
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
-        }
+        let data = try await performGET(url)
 
         let decoder = JSONDecoder()
-        let rootResp = try decoder.decode(GetPostThreadResponse.self, from: data)
+        let rootResp: GetPostThreadResponse
+        do { rootResp = try decoder.decode(GetPostThreadResponse.self, from: data) }
+        catch let e as DecodingError { throw APIError.decoding(e) }
         guard case let .threadViewPost(node) = rootResp.thread else { return [] }
 
         // Walk parent chain up to root; then reverse to oldest → newest
@@ -110,17 +92,11 @@ struct BlueskyClient: SocialClient {
         comps?.queryItems = [ URLQueryItem(name: "actor", value: handle) ]
         guard let url = comps?.url else { throw URLError(.badURL) }
 
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let data = try await performGET(url)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
-        }
-
-        let prof = try JSONDecoder().decode(BskyProfile.self, from: data)
+        let prof: BskyProfile
+        do { prof = try JSONDecoder().decode(BskyProfile.self, from: data) }
+        catch let e as DecodingError { throw APIError.decoding(e) }
         let bio = prof.description.flatMap { AttributedString($0) }
         return UnifiedUser(
             id: "bsky:\(prof.did)",
@@ -145,17 +121,11 @@ struct BlueskyClient: SocialClient {
         comps?.queryItems = items
         guard let url = comps?.url else { throw URLError(.badURL) }
 
-        var req = URLRequest(url: url)
-        req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let data = try await performGET(url)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
-        }
-
-        let decoded = try JSONDecoder().decode(AuthorFeedResponse.self, from: data)
+        let decoded: AuthorFeedResponse
+        do { decoded = try JSONDecoder().decode(AuthorFeedResponse.self, from: data) }
+        catch let e as DecodingError { throw APIError.decoding(e) }
         let mapped: [UnifiedPost] = decoded.feed.compactMap { item in
             let p = item.post
             guard let rec = p.record, rec.type == "app.bsky.feed.post" else { return nil }
@@ -168,6 +138,27 @@ struct BlueskyClient: SocialClient {
     func like(post: UnifiedPost) async throws { /* TODO: app.bsky.feed.like */ }
     func repost(post: UnifiedPost) async throws { /* TODO: app.bsky.feed.repost */ }
     func reply(to post: UnifiedPost, text: String) async throws { /* TODO: app.bsky.feed.post */ }
+
+    // MARK: - Request helper
+    private func performGET(_ url: URL) async throws -> Data {
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { throw APIError.network(URLError(.badServerResponse)) }
+            guard (200..<300).contains(http.statusCode) else {
+                let bodyStr = String(data: data, encoding: .utf8)
+                throw APIError.badStatus(http.statusCode, body: bodyStr)
+            }
+            return data
+        } catch let e as URLError {
+            throw APIError.network(e)
+        } catch {
+            throw APIError.unknown(error)
+        }
+    }
 
     // MARK: - Flatten helpers
     private func flatten(_ list: [ThreadUnion], into out: inout [ThreadItem], depth: Int) {
@@ -230,7 +221,31 @@ struct BlueskyClient: SocialClient {
     }
 
     // MARK: - API models
-    private enum APIError: Error { case badStatus(Int) }
+    enum APIError: LocalizedError {
+        case badStatus(Int, body: String?)
+        case decoding(DecodingError)
+        case network(URLError)
+        case unknown(Error)
+
+        var errorDescription: String? {
+            switch self {
+            case .badStatus(let code, let body):
+                if let body,
+                   let data = body.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let message = (obj["message"] as? String) ?? (obj["error"] as? String) {
+                    return "Bluesky returned \(code): \(message)"
+                }
+                return "Bluesky returned HTTP \(code)"
+            case .decoding:
+                return "Couldn’t read data from Bluesky."
+            case .network(let e):
+                return e.localizedDescription
+            case .unknown(let e):
+                return e.localizedDescription
+            }
+        }
+    }
 
     private struct GetTimelineResponse: Decodable {
         let feed: [FeedViewPost]

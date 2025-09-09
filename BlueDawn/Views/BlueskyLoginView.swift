@@ -39,7 +39,7 @@ struct BlueskyLoginView: View {
               !identifier.isEmpty, !appPassword.isEmpty else { return }
 
         struct CreateSessionReq: Encodable { let identifier: String; let password: String }
-        struct CreateSessionResp: Decodable { let accessJwt: String; let did: String; let handle: String }
+        struct CreateSessionResp: Decodable { let accessJwt: String; let refreshJwt: String; let did: String; let handle: String }
 
         do {
             var url = serviceURL
@@ -47,6 +47,7 @@ struct BlueskyLoginView: View {
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
             req.httpBody = try JSONEncoder().encode(CreateSessionReq(identifier: identifier, password: appPassword))
 
             let (data, resp) = try await URLSession.shared.data(for: req)
@@ -54,8 +55,8 @@ struct BlueskyLoginView: View {
 
             let sessionResp = try JSONDecoder().decode(CreateSessionResp.self, from: data)
 
-            // Hydrate session with a Bluesky client
-            session.setBlueskySession(pdsURL: serviceURL, accessToken: sessionResp.accessJwt, handle: sessionResp.handle)
+            // Persist + activate
+            session.setBlueskySession(pdsURL: serviceURL, accessToken: sessionResp.accessJwt, refreshJwt: sessionResp.refreshJwt, handle: sessionResp.handle)
 
             appPassword = "" // clear secret from memory/UI
         } catch {

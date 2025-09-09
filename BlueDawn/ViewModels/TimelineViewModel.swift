@@ -35,18 +35,32 @@ final class TimelineViewModel {
     // MARK: - Public API used by the view
 
     func refresh() async {
-        // prevent overlapping refreshes (can cause duplicates)
         if isLoading { return }
         isLoading = true
         error = nil
         defer { isLoading = false }
+
         do {
             async let m: Void = fetchMastodon(resetCursor: true)
             async let b: Void = fetchBluesky(resetCursor: true)
             _ = try await (m, b)
             applyFilter()
         } catch {
-            self.error = error.localizedDescription
+            if case BlueskyClient.APIError.badStatus(let code, _) = error, code == 401 {
+                if await session.refreshBlueskyIfNeeded() {
+                    // Retry once with fresh token
+                    do {
+                        async let m: Void = fetchMastodon(resetCursor: true)
+                        async let b: Void = fetchBluesky(resetCursor: true)
+                        _ = try await (m, b)
+                        applyFilter()
+                        return
+                    } catch { /* fall through to show error */ }
+                } else {
+                    session.signOutBluesky()
+                }
+            }
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
@@ -61,13 +75,28 @@ final class TimelineViewModel {
         isLoadingMore = true
         error = nil
         defer { isLoadingMore = false }
+
         do {
             async let m: Void = fetchMastodon(resetCursor: false)
             async let b: Void = fetchBluesky(resetCursor: false)
             _ = try await (m, b)
             applyFilter()
         } catch {
-            self.error = error.localizedDescription
+            if case BlueskyClient.APIError.badStatus(let code, _) = error, code == 401 {
+                if await session.refreshBlueskyIfNeeded() {
+                    // Retry once with fresh token
+                    do {
+                        async let m: Void = fetchMastodon(resetCursor: false)
+                        async let b: Void = fetchBluesky(resetCursor: false)
+                        _ = try await (m, b)
+                        applyFilter()
+                        return
+                    } catch { /* fall through */ }
+                } else {
+                    session.signOutBluesky()
+                }
+            }
+            self.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 
