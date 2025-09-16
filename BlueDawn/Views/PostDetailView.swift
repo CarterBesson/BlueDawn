@@ -4,6 +4,7 @@ struct PostDetailView: View {
     @Environment(SessionStore.self) private var session
     let post: UnifiedPost
     @State var viewModel: ThreadViewModel
+    // Shared interaction state is kept in SessionStore; no local state needed
     @State private var initialPosition: String? = "focusedPost"
     @State private var imageViewer: ImageViewerState? = nil
     @State private var profileRoute: ProfileRoute? = nil
@@ -291,15 +292,129 @@ struct PostDetailView: View {
     // MARK: - Actions
     private var actionBar: some View {
         HStack(spacing: 24) {
-            Image(systemName: "bubble.left")
-            Image(systemName: "arrow.2.squarepath")
-            Image(systemName: "heart")
+            Button { /* TODO: reply composer */ } label: { Image(systemName: "bubble.left") }
+            Button { Task { await handleRepost() } } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.2.squarepath").foregroundStyle(state.isReposted ? Color.accentColor : Color.secondary)
+                    if let s = Formatters.shortCount(state.repostCount) { Text(s).accessibilityHidden(true) }
+                }
+            }
+            Button { Task { await handleLike() } } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: state.isLiked ? "heart.fill" : "heart").foregroundStyle(state.isLiked ? Color.accentColor : Color.secondary)
+                    if let s = Formatters.shortCount(state.likeCount) { Text(s).accessibilityHidden(true) }
+                }
+            }
+            if case .mastodon = post.network {
+                Button { Task { await handleBookmark() } } label: {
+                    Image(systemName: state.isBookmarked ? "bookmark.fill" : "bookmark").foregroundStyle(state.isBookmarked ? Color.accentColor : Color.secondary)
+                }
+            }
             Spacer()
         }
         .font(.title3)
         .foregroundStyle(.secondary)
         .padding(.top, 8)
+        .buttonStyle(.plain)
     }
+
+    @MainActor private func handleLike() async {
+        let s = state
+        let prevLiked = s.isLiked
+        let prevCount = s.likeCount
+        let prevRkey = s.bskyLikeRkey
+        if s.isLiked {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: post.id) { $0.isLiked = false; $0.likeCount = max(0, prevCount - 1) } }
+            switch post.network {
+            case .bluesky:
+                do { try await session.blueskyClient?.unlike(post: post, rkey: prevRkey) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: post.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+                }
+            case .mastodon:
+                do { try await session.mastodonClient?.unlike(post: post, rkey: nil) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: post.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+                }
+            }
+            return
+        }
+        Haptics.impact(.light)
+        withAnimation { session.updateState(for: post.id) { $0.isLiked = true; $0.likeCount = prevCount + 1 } }
+        switch post.network {
+        case .bluesky:
+            do { let rkey = try await session.blueskyClient?.like(post: post); withAnimation { session.updateState(for: post.id) { $0.bskyLikeRkey = rkey ?? prevRkey } } } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: post.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+            }
+        case .mastodon:
+            do { _ = try await session.mastodonClient?.like(post: post) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: post.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+            }
+        }
+    }
+
+    @MainActor private func handleRepost() async {
+        let s = state
+        let prev = s.isReposted
+        let prevCount = s.repostCount
+        let prevRkey = s.bskyRepostRkey
+        if s.isReposted {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: post.id) { $0.isReposted = false; $0.repostCount = max(0, prevCount - 1) } }
+            switch post.network {
+            case .bluesky:
+                do { try await session.blueskyClient?.unrepost(post: post, rkey: prevRkey) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: post.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+                }
+            case .mastodon(_):
+                do { try await session.mastodonClient?.unrepost(post: post, rkey: nil) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: post.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+                }
+            }
+            return
+        }
+        Haptics.impact(.light)
+        withAnimation { session.updateState(for: post.id) { $0.isReposted = true; $0.repostCount = prevCount + 1 } }
+        switch post.network {
+        case .bluesky:
+            do { let rkey = try await session.blueskyClient?.repost(post: post); withAnimation { session.updateState(for: post.id) { $0.bskyRepostRkey = rkey ?? prevRkey } } } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: post.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+            }
+        case .mastodon(_):
+            do { _ = try await session.mastodonClient?.repost(post: post) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: post.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+            }
+        }
+    }
+
+    @MainActor private func handleBookmark() async {
+        guard case .mastodon = post.network else { return }
+        let prev = state.isBookmarked
+        if state.isBookmarked {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: post.id) { $0.isBookmarked = false } }
+            do { try await session.mastodonClient?.unbookmark(post: post) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: post.id) { $0.isBookmarked = prev } }
+            }
+        } else {
+            Haptics.impact(.light)
+            withAnimation { session.updateState(for: post.id) { $0.isBookmarked = true } }
+            do { try await session.mastodonClient?.bookmark(post: post) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: post.id) { $0.isBookmarked = prev } }
+            }
+        }
+    }
+
+    private var state: PostInteractionState { session.state(for: post) }
 
     // MARK: - Toolbar
     @ToolbarContentBuilder

@@ -11,6 +11,9 @@ final class SessionStore {
     var isMastodonSignedIn = false
     var signedInHandleBluesky: String?
     var signedInHandleMastodon: String?
+    var blueskyDid: String?
+    // Shared per-post interaction cache
+    var postStates: [String: PostInteractionState] = [:]
 
     // MARK: - Persistence keys
     private let KC_SERVICE = "BlueDawn"
@@ -76,13 +79,12 @@ final class SessionStore {
             blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: token)
             isBlueskySignedIn = true
             signedInHandleBluesky = UserDefaults.standard.string(forKey: UD_BSKY_HANDLE)
-
             // If the token is expiring soon, refresh immediately
             if isExpiringSoon(token) {
-                if await refreshBlueskyIfNeeded() == false {
-                    // If refresh fails, keep current client but mark as needing auth soon.
-                }
+                _ = await refreshBlueskyIfNeeded()
             }
+            // Populate identity (DID/handle) for features that require it
+            await populateBlueskyIdentityIfNeeded()
         }
 
         // Mastodon
@@ -95,15 +97,16 @@ final class SessionStore {
     }
 
     // MARK: - Set sessions
-    func setBlueskySession(pdsURL: URL, accessToken: String, refreshJwt: String, handle: String) {
+    func setBlueskySession(pdsURL: URL, accessToken: String, refreshJwt: String, did: String, handle: String) {
         Keychain.save(token: accessToken, service: KC_SERVICE, account: KC_BSKY_TOKEN)
         Keychain.save(token: refreshJwt, service: KC_SERVICE, account: KC_BSKY_REFRESH)
         UserDefaults.standard.set(pdsURL.absoluteString, forKey: UD_BSKY_PDS)
         UserDefaults.standard.set(handle, forKey: UD_BSKY_HANDLE)
 
-        blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: accessToken)
+        blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: accessToken, did: did)
         isBlueskySignedIn = true
         signedInHandleBluesky = handle
+        blueskyDid = did
     }
 
     func setMastodonSession(baseURL: URL, accessToken: String) {
@@ -166,6 +169,25 @@ final class SessionStore {
         }
     }
 
+    private func populateBlueskyIdentityIfNeeded() async {
+        guard let client = blueskyClient, client.did == nil else { return }
+        var url = client.pdsURL; url.append(path: "/xrpc/com.atproto.server.getSession")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(client.accessToken)", forHTTPHeaderField: "Authorization")
+        struct SessionResp: Decodable { let did: String; let handle: String }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return }
+            let decoded = try JSONDecoder().decode(SessionResp.self, from: data)
+            blueskyDid = decoded.did
+            var updated = client
+            updated.did = decoded.did
+            blueskyClient = updated
+            signedInHandleBluesky = decoded.handle
+        } catch { /* ignore */ }
+    }
+
     // MARK: - Sign out
     func signOutBluesky() {
         blueskyClient = nil
@@ -188,5 +210,19 @@ final class SessionStore {
     /// Call this before performing an API call to ensure the token is fresh.
     func ensureValidBlueskyAccess() async {
         _ = await blueskyClientEnsuringFreshToken()
+    }
+
+    // MARK: - Shared post state helpers
+    func state(for post: UnifiedPost) -> PostInteractionState {
+        if let s = postStates[post.id] { return s }
+        let s = PostInteractionState.fromPost(post)
+        postStates[post.id] = s
+        return s
+    }
+
+    func updateState(for postID: String, _ mutate: (inout PostInteractionState) -> Void) {
+        var s = postStates[postID] ?? PostInteractionState(isLiked: false, isReposted: false, isBookmarked: false, likeCount: 0, repostCount: 0, bskyLikeRkey: nil, bskyRepostRkey: nil)
+        mutate(&s)
+        postStates[postID] = s
     }
 }
