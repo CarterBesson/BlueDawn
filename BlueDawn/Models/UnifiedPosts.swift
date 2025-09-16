@@ -6,6 +6,14 @@ struct PostCounts: Codable, Hashable {
     var favLikes: Int?
 }
 
+struct ThreadPreview: Codable, Hashable {
+    let recentReplies: [UnifiedPost] // Most recent 1-2 replies
+    let totalReplyCount: Int
+    let hasMoreReplies: Bool
+    let newestPostDate: Date // Used for timeline positioning
+    let conversationParticipants: Set<String> // Handles of participants
+}
+
 struct UnifiedPost: Identifiable, Hashable, Codable {
     enum CWOrLabel: Hashable, Codable { case cw(String), label(String) }
 
@@ -21,4 +29,9 @@ struct UnifiedPost: Identifiable, Hashable, Codable {
     var counts: PostCounts
     var inReplyToID: String?
     var isRepostOrBoost: Bool
+    var boostedByHandle: String?
+    var boostedByDisplayName: String?
+    var crossPostAlternates: [Network: String]? = nil
+    var isCrossPostCanonical: Bool = false
+    var threadPreview: ThreadPreview? = nil // Set when this is the root of a thread to display
 }

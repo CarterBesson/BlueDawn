@@ -12,6 +12,35 @@ struct BlueskyClient: SocialClient {
         comps?.queryItems = items
 
         guard let url = comps?.url else { throw URLError(.badURL) }
+        // Load the authed user's DID and their following DIDs so we can filter replies reliably
+        struct Session: Decodable { let did: String; let handle: String }
+        func getSession() async throws -> Session {
+            var sComps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+            sComps?.path = "/xrpc/com.atproto.server.getSession"
+            guard let sURL = sComps?.url else { throw URLError(.badURL) }
+            let data = try await performGET(sURL)
+            return try JSONDecoder().decode(Session.self, from: data)
+        }
+        struct FollowsResponse: Decodable { let cursor: String?; let follows: [BskyProfile] }
+        func getFollowingSet(actor did: String, cap: Int = 2000) async throws -> Set<String> {
+            var out = Set<String>()
+            var next: String? = nil
+            repeat {
+                var fComps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+                fComps?.path = "/xrpc/app.bsky.graph.getFollows"
+                var q = [URLQueryItem(name: "actor", value: did), URLQueryItem(name: "limit", value: "100")]
+                if let next { q.append(URLQueryItem(name: "cursor", value: next)) }
+                fComps?.queryItems = q
+                guard let fURL = fComps?.url else { break }
+                let data = try await performGET(fURL)
+                let resp = try JSONDecoder().decode(FollowsResponse.self, from: data)
+                for p in resp.follows { out.insert(p.did) }
+                next = resp.cursor
+            } while next != nil && out.count < cap
+            return out
+        }
+        let session = try await getSession()
+        let followingDIDs = try await getFollowingSet(actor: session.did)
         let data = try await performGET(url)
 
         let decoder = JSONDecoder()
@@ -23,8 +52,16 @@ struct BlueskyClient: SocialClient {
         let mapped = tl.feed.compactMap { feedItem -> UnifiedPost? in
             let p = feedItem.post
             guard let rec = p.record, rec.type == "app.bsky.feed.post" else { return nil }
+            // Exclude replies unless they are to authors I follow
+            if let r = p.reply, let parentAuthor = r.parent?.author {
+                let followedViaViewer = (parentAuthor.viewer?.following != nil)
+                let followedViaSet = followingDIDs.contains(parentAuthor.did)
+                if !(followedViaViewer || followedViaSet) { return nil }
+            }
             let isRepost = (feedItem.reason?.type == "app.bsky.feed.defs#reasonRepost")
-            return mapPostToUnified(p, isRepost: isRepost)
+            let boostedHandle = isRepost ? feedItem.reason?.by?.handle : nil
+            let boostedName   = isRepost ? feedItem.reason?.by?.displayName : nil
+            return mapPostToUnified(p, isRepost: isRepost, boostedByHandle: boostedHandle, boostedByDisplayName: boostedName)
         }
         return (mapped, tl.cursor)
     }
@@ -130,7 +167,9 @@ struct BlueskyClient: SocialClient {
             let p = item.post
             guard let rec = p.record, rec.type == "app.bsky.feed.post" else { return nil }
             let isRepost = (item.reason?.type == "app.bsky.feed.defs#reasonRepost")
-            return mapPostToUnified(p, isRepost: isRepost)
+            let boostedHandle = isRepost ? item.reason?.by?.handle : nil
+            let boostedName   = isRepost ? item.reason?.by?.displayName : nil
+            return mapPostToUnified(p, isRepost: isRepost, boostedByHandle: boostedHandle, boostedByDisplayName: boostedName)
         }
         return (mapped, decoded.cursor)
     }
@@ -176,10 +215,75 @@ struct BlueskyClient: SocialClient {
         }
     }
 
+    // MARK: - Rich text helpers (links from facets + fallback detection)
+    private func indexAtByteOffset(_ byteOffset: Int, in s: String) -> String.Index? {
+        var i = s.startIndex
+        var b = 0
+        while true {
+            if b == byteOffset { return i }
+            guard i < s.endIndex else { break }
+            b += s[i].utf8.count
+            i = s.index(after: i)
+        }
+        return nil
+    }
+
+    private func attributedFromBsky(text raw: String, facets: [Facet]?) -> AttributedString {
+        var attr = AttributedString(raw)
+
+        // Apply links from facets (http links and mentions)
+        if let facets {
+            for f in facets {
+                guard let s = indexAtByteOffset(f.index.byteStart, in: raw),
+                      let e = indexAtByteOffset(f.index.byteEnd, in: raw), s <= e else { continue }
+
+                let lowerChars = raw.distance(from: raw.startIndex, to: s)
+                let upperChars = raw.distance(from: raw.startIndex, to: e)
+                let lower = attr.characters.index(attr.startIndex, offsetBy: lowerChars)
+                let upper = attr.characters.index(attr.startIndex, offsetBy: upperChars)
+
+                for feature in f.features {
+                    switch feature {
+                    case .link(let uri):
+                        if let url = URL(string: uri) {
+                            attr[lower..<upper].link = url
+                        }
+                    case .mention:
+                        // Build an internal link that encodes the visible handle (e.g., @alice.bsky.social)
+                        let visible = String(raw[s..<e])
+                        let handle = visible.hasPrefix("@") ? String(visible.dropFirst()) : visible
+                        if let url = URL(string: "bluesky://profile/\(handle)") {
+                            attr[lower..<upper].link = url
+                        }
+                    default:
+                        continue
+                    }
+                }
+            }
+        }
+
+        // Fallback: detect http(s) links when no facet present
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) {
+            let ns = raw as NSString
+            let matches = detector.matches(in: raw, options: [], range: NSRange(location: 0, length: ns.length))
+            for m in matches {
+                guard let url = m.url, let r = Range(m.range, in: raw) else { continue }
+                let lowerChars = raw.distance(from: raw.startIndex, to: r.lowerBound)
+                let upperChars = raw.distance(from: raw.startIndex, to: r.upperBound)
+                let lower = attr.characters.index(attr.startIndex, offsetBy: lowerChars)
+                let upper = attr.characters.index(attr.startIndex, offsetBy: upperChars)
+                if attr[lower..<upper].link == nil { // don't overwrite facet links
+                    attr[lower..<upper].link = url
+                }
+            }
+        }
+        return attr
+    }
+
     // MARK: - Mapping
-    private func mapPostToUnified(_ p: Post, isRepost: Bool = false) -> UnifiedPost {
+    private func mapPostToUnified(_ p: Post, isRepost: Bool = false, boostedByHandle: String? = nil, boostedByDisplayName: String? = nil) -> UnifiedPost {
         let created = parseISO8601(p.record?.createdAt ?? p.indexedAt ?? "") ?? Date()
-        let text = AttributedString(p.record?.text ?? "")
+        let text = attributedFromBsky(text: p.record?.text ?? "", facets: p.record?.facets)
         let media: [Media] = {
             guard let embed = p.embed else { return [] }
             switch embed {
@@ -209,7 +313,9 @@ struct BlueskyClient: SocialClient {
             cwOrLabels: nil,
             counts: counts,
             inReplyToID: nil,
-            isRepostOrBoost: isRepost
+            isRepostOrBoost: isRepost,
+            boostedByHandle: boostedByHandle,
+            boostedByDisplayName: boostedByDisplayName
         )
     }
 
@@ -259,7 +365,8 @@ struct BlueskyClient: SocialClient {
 
     private struct Reason: Decodable {
         let type: String
-        enum CodingKeys: String, CodingKey { case type = "$type" }
+        let by: Author?
+        enum CodingKeys: String, CodingKey { case type = "$type"; case by }
     }
 
     private struct GetPostThreadResponse: Decodable {
@@ -304,6 +411,20 @@ struct BlueskyClient: SocialClient {
         let replyCount: Int?
         let repostCount: Int?
         let indexedAt: String?
+
+        // Reply context from app.bsky.feed.defs#postView
+        let reply: ReplyContext?
+
+        enum CodingKeys: String, CodingKey {
+            case uri, cid, author, record, embed, likeCount, replyCount, repostCount, indexedAt
+            case reply
+        }
+
+        struct ReplyContext: Decodable {
+            let parent: ReplyPost?
+            let root: ReplyPost?
+        }
+        struct ReplyPost: Decodable { let author: Author }
     }
 
     private struct Author: Decodable {
@@ -311,16 +432,54 @@ struct BlueskyClient: SocialClient {
         let handle: String
         let displayName: String?
         let avatar: String?
+        let viewer: Viewer?                 // present when API includes viewer info
+
+        struct Viewer: Decodable {          // non-nil `following` means you follow them
+            let following: String?
+        }
     }
 
     private struct Record: Decodable {
         let type: String
         let text: String
         let createdAt: String
+        let facets: [Facet]?            // NEW
         enum CodingKeys: String, CodingKey {
             case type = "$type"
             case text
             case createdAt
+            case facets
+        }
+    }
+
+    private struct Facet: Decodable {
+        let index: FacetIndex
+        let features: [Feature]
+        struct FacetIndex: Decodable { let byteStart: Int; let byteEnd: Int }
+    }
+
+    private enum Feature: Decodable {
+        case link(uri: String)
+        case mention(did: String)
+        case tag(tag: String)
+        case unknown
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: DynamicCodingKeys.self)
+            let t = try c.decodeIfPresent(String.self, forKey: DynamicCodingKeys(stringValue: "$type")!) ?? ""
+            switch t {
+            case "app.bsky.richtext.facet#link":
+                struct L: Decodable { let uri: String }
+                self = .link(uri: try L(from: decoder).uri)
+            case "app.bsky.richtext.facet#mention":
+                struct M: Decodable { let did: String }
+                self = .mention(did: try M(from: decoder).did)
+            case "app.bsky.richtext.facet#tag":
+                struct T: Decodable { let tag: String }
+                self = .tag(tag: try T(from: decoder).tag)
+            default:
+                self = .unknown
+            }
         }
     }
 

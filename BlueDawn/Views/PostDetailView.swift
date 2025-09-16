@@ -4,6 +4,15 @@ struct PostDetailView: View {
     @Environment(SessionStore.self) private var session
     let post: UnifiedPost
     @State var viewModel: ThreadViewModel
+    @State private var initialPosition: String? = "focusedPost"
+    @State private var imageViewer: ImageViewerState? = nil
+    @State private var profileRoute: ProfileRoute? = nil
+
+    private struct ProfileRoute: Identifiable, Hashable {
+        let id = UUID()
+        let network: Network
+        let handle: String
+    }
 
     init(post: UnifiedPost, viewModel: ThreadViewModel) {
         self.post = post
@@ -12,17 +21,18 @@ struct PostDetailView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            LazyVStack(alignment: .leading, spacing: 16) {
 
                 // Ancestor context ABOVE the focused post
                 if !viewModel.ancestors.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
                         Text("In reply to")
-                            .font(.headline)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
                             .padding(.bottom, 8)
 
                         ForEach(viewModel.ancestors, id: \.id) { anc in
-                            HStack(alignment: .top, spacing: 10) {
+                            HStack(alignment: .top, spacing: 12) {
                                 // Avatar → Profile
                                 NavigationLink {
                                     ProfileView(network: anc.network, handle: anc.authorHandle, session: session)
@@ -39,7 +49,7 @@ struct PostDetailView: View {
                                             }
                                         } else { Circle().fill(Color.secondary.opacity(0.2)) }
                                     }
-                                    .frame(width: 28, height: 28)
+                                    .frame(width: 44, height: 44)
                                     .clipShape(Circle())
                                 }
                                 .buttonStyle(.plain)
@@ -48,41 +58,78 @@ struct PostDetailView: View {
                                 NavigationLink {
                                     PostDetailView(post: anc, viewModel: ThreadViewModel(session: session, root: anc))
                                 } label: {
-                                    VStack(alignment: .leading, spacing: 2) {
+                                    VStack(alignment: .leading, spacing: 4) {
                                         Text(anc.authorDisplayName?.isEmpty == false ? anc.authorDisplayName! : anc.authorHandle)
-                                            .font(.subheadline.weight(.semibold))
+                                            .font(.headline.weight(.semibold))
                                             .lineLimit(1)
                                         Text(anc.text)
-                                            .font(.footnote)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(2)
+                                            .font(.body)
+                                            .foregroundStyle(.primary)
+                                            .fixedSize(horizontal: false, vertical: true)
                                     }
                                 }
                                 .buttonStyle(.plain)
 
                                 Spacer(minLength: 0)
                             }
-                            .padding(.vertical, 6)
+                            .padding(.vertical, 10)
                             Divider()
                         }
                     }
                     .padding(.bottom, 8)
                 }
 
-                header
-                content
-                if !post.media.isEmpty { mediaGrid }
-                actionBar
+                VStack(alignment: .leading, spacing: 8) {
+                    header
+                    content
+                    if !post.media.isEmpty { mediaGrid }
+                    actionBar
+                }
+                .id("focusedPost")
+
                 Divider().padding(.vertical, 6)
                 repliesSection
+                    .animation(nil, value: viewModel.items.count)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .scrollTargetLayout()
+                .scrollTargetBehavior(.viewAligned)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 20)
-        }
-        .navigationTitle("Post")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar { toolbarItems }
-        .task { await viewModel.load() }
+            .scrollPosition(id: $initialPosition, anchor: .top)
+            .navigationTitle("Post")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { toolbarItems }
+            .environment(\.openURL, OpenURLAction { url in
+                if url.scheme == "bluesky" && url.host == "profile" {
+                    let comps = url.pathComponents.filter { $0 != "/" }
+                    if let handle = comps.first { profileRoute = ProfileRoute(network: .bluesky, handle: handle); return .handled }
+                }
+                if let scheme = url.scheme, (scheme == "https" || scheme == "http"), let host = url.host {
+                    let path = url.path
+                    if path.hasPrefix("/@") {
+                        let username = String(path.dropFirst(2))
+                        let handle = "\(username)@\(host)"
+                        profileRoute = ProfileRoute(network: .mastodon(instance: host), handle: handle)
+                        return .handled
+                    }
+                    if host == "bsky.app" && path.hasPrefix("/profile/") {
+                        let handle = String(path.dropFirst("/profile/".count))
+                        profileRoute = ProfileRoute(network: .bluesky, handle: handle)
+                        return .handled
+                    }
+                }
+                return .systemAction
+            })
+            .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
+                ImageViewer(post: selection.post, startIndex: selection.index)
+            }
+            .task {
+                await viewModel.load()
+            }
+            .navigationDestination(item: $profileRoute) { route in
+                ProfileView(network: route.network, handle: route.handle, session: session)
+            }
     }
 
     // MARK: - Header
@@ -158,22 +205,28 @@ struct PostDetailView: View {
     // MARK: - Media
     private var mediaGrid: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)], spacing: 10) {
-            ForEach(Array(post.media.enumerated()), id: \.offset) { _, m in
-                AsyncImage(url: m.url) { phase in
-                    switch phase {
-                    case .empty:
-                        Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
-                    case .success(let image):
-                        image.resizable().scaledToFill()
-                    case .failure:
-                        Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo"))
-                    @unknown default:
-                        Rectangle().fill(Color.secondary.opacity(0.15))
+            ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
+                Button {
+                    imageViewer = ImageViewerState(post: post, index: idx)
+                } label: {
+                    AsyncImage(url: m.url) { phase in
+                        switch phase {
+                        case .empty:
+                            Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
+                        case .success(let image):
+                            image.resizable().scaledToFill()
+                        case .failure:
+                            Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo"))
+                        @unknown default:
+                            Rectangle().fill(Color.secondary.opacity(0.15))
+                        }
                     }
+                    .frame(height: 200)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
                 }
-                .frame(height: 200)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
             }
         }
     }
