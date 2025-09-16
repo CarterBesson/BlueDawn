@@ -267,17 +267,13 @@ struct MastodonClient: SocialClient {
             cwOrLabels: cwLabels,
             counts: PostCounts(replies: s.replies_count, boostsReposts: s.reblogs_count, favLikes: s.favourites_count),
             inReplyToID: src.in_reply_to_id,
-<<<<<<< HEAD
-            isRepostOrBoost: s.reblog != nil,
+            isRepostOrBoost: isBoost,
             bskyCID: nil,
             isLiked: s.favourited ?? false,
             isReposted: s.reblogged ?? false,
-            isBookmarked: s.bookmarked ?? false
-=======
-            isRepostOrBoost: isBoost,
+            isBookmarked: s.bookmarked ?? false,
             boostedByHandle: boostedHandle,
             boostedByDisplayName: boostedName
->>>>>>> main
         )
     }
 
