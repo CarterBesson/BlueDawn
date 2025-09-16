@@ -21,4 +21,12 @@ struct UnifiedPost: Identifiable, Hashable, Codable {
     var counts: PostCounts
     var inReplyToID: String?
     var isRepostOrBoost: Bool
+    // Optional per-network metadata (kept lightweight)
+    var bskyCID: String? // For Bluesky like/repost subjects
+    var bskyLikeRkey: String? // For Bluesky unlike
+    var bskyRepostRkey: String? // For Bluesky unrepost
+    // Lightweight interaction state for optimistic UI
+    var isLiked: Bool? = false
+    var isReposted: Bool? = false
+    var isBookmarked: Bool? = false
 }

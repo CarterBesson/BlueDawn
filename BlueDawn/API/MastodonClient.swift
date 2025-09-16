@@ -94,8 +94,64 @@ struct MastodonClient: SocialClient {
         return sorted.map { mapStatusToUnified($0) }
     }
 
-    func like(post: UnifiedPost) async throws { /* TODO: POST /api/v1/statuses/:id/favourite */ }
-    func repost(post: UnifiedPost) async throws { /* TODO: POST /api/v1/statuses/:id/reblog */ }
+    func like(post: UnifiedPost) async throws -> String? {
+        guard case .mastodon = post.network else { return nil }
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return nil }
+        var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/favourite")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        return nil
+    }
+
+    func repost(post: UnifiedPost) async throws -> String? {
+        guard case .mastodon = post.network else { return nil }
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return nil }
+        var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/reblog")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        return nil
+    }
+    
+    func unlike(post: UnifiedPost, rkey: String?) async throws {
+        guard case .mastodon = post.network else { return }
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return }
+        var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/unfavourite")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+    }
+
+    func unrepost(post: UnifiedPost, rkey: String?) async throws {
+        guard case .mastodon = post.network else { return }
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return }
+        var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/unreblog")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+    }
+
     func reply(to post: UnifiedPost, text: String) async throws { /* TODO: POST /api/v1/statuses */ }
 
     // MARK: - Profile
@@ -208,7 +264,11 @@ struct MastodonClient: SocialClient {
             cwOrLabels: cwLabels,
             counts: PostCounts(replies: s.replies_count, boostsReposts: s.reblogs_count, favLikes: s.favourites_count),
             inReplyToID: src.in_reply_to_id,
-            isRepostOrBoost: s.reblog != nil
+            isRepostOrBoost: s.reblog != nil,
+            bskyCID: nil,
+            isLiked: s.favourited ?? false,
+            isReposted: s.reblogged ?? false,
+            isBookmarked: s.bookmarked ?? false
         )
     }
 
@@ -246,6 +306,9 @@ struct MastodonClient: SocialClient {
         let replies_count: Int?
         let reblogs_count: Int?
         let favourites_count: Int?
+        let reblogged: Bool?
+        let favourited: Bool?
+        let bookmarked: Bool?
     }
 
     private struct Account: Decodable {
@@ -271,4 +334,33 @@ struct MastodonClient: SocialClient {
     }
 
     private struct MediaAttachment: Decodable { let id: String; let type: String; let url: String; let preview_url: String?; let description: String? }
+
+    // MARK: - Bookmark
+    func bookmark(post: UnifiedPost) async throws {
+        guard case .mastodon = post.network else { return }
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return }
+        var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/bookmark")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+    }
+
+    func unbookmark(post: UnifiedPost) async throws {
+        guard case .mastodon = post.network else { return }
+        guard let id = post.id.split(separator: ":").last.map(String.init) else { return }
+        var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/unbookmark")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+    }
 }

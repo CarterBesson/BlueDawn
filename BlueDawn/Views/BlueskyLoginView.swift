@@ -56,7 +56,7 @@ struct BlueskyLoginView: View {
             let sessionResp = try JSONDecoder().decode(CreateSessionResp.self, from: data)
 
             // Persist + activate
-            session.setBlueskySession(pdsURL: serviceURL, accessToken: sessionResp.accessJwt, refreshJwt: sessionResp.refreshJwt, handle: sessionResp.handle)
+            session.setBlueskySession(pdsURL: serviceURL, accessToken: sessionResp.accessJwt, refreshJwt: sessionResp.refreshJwt, did: sessionResp.did, handle: sessionResp.handle)
 
             appPassword = "" // clear secret from memory/UI
         } catch {

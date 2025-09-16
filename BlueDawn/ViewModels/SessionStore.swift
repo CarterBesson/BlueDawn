@@ -11,6 +11,9 @@ final class SessionStore {
     var isMastodonSignedIn = false
     var signedInHandleBluesky: String?
     var signedInHandleMastodon: String?
+    var blueskyDid: String?
+    // Shared per-post interaction cache
+    var postStates: [String: PostInteractionState] = [:]
 
     // MARK: - Persistence keys
     private let KC_SERVICE = "BlueDawn"
@@ -29,10 +32,12 @@ final class SessionStore {
         if let token = Keychain.loadToken(service: KC_SERVICE, account: KC_BSKY_TOKEN),
            let pdsString = UserDefaults.standard.string(forKey: UD_BSKY_PDS),
            let pdsURL = URL(string: pdsString) {
-            blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: token)
+            blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: token, did: nil)
             isBlueskySignedIn = true
             signedInHandleBluesky = UserDefaults.standard.string(forKey: UD_BSKY_HANDLE)
+            // Attempt to refresh token and populate DID/handle
             _ = await refreshBlueskyIfNeeded()
+            await populateBlueskyIdentityIfNeeded()
         }
 
         // Mastodon
@@ -45,15 +50,16 @@ final class SessionStore {
     }
 
     // MARK: - Set sessions
-    func setBlueskySession(pdsURL: URL, accessToken: String, refreshJwt: String, handle: String) {
+    func setBlueskySession(pdsURL: URL, accessToken: String, refreshJwt: String, did: String, handle: String) {
         Keychain.save(token: accessToken, service: KC_SERVICE, account: KC_BSKY_TOKEN)
         Keychain.save(token: refreshJwt, service: KC_SERVICE, account: KC_BSKY_REFRESH)
         UserDefaults.standard.set(pdsURL.absoluteString, forKey: UD_BSKY_PDS)
         UserDefaults.standard.set(handle, forKey: UD_BSKY_HANDLE)
 
-        blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: accessToken)
+        blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: accessToken, did: did)
         isBlueskySignedIn = true
         signedInHandleBluesky = handle
+        blueskyDid = did
     }
 
     func setMastodonSession(baseURL: URL, accessToken: String) {
@@ -96,13 +102,34 @@ final class SessionStore {
             if let h = decoded.handle { UserDefaults.standard.set(h, forKey: UD_BSKY_HANDLE) }
 
             // Hydrate client
-            blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: decoded.accessJwt)
+            blueskyClient = BlueskyClient(pdsURL: pdsURL, accessToken: decoded.accessJwt, did: blueskyDid)
             isBlueskySignedIn = true
             if let h = decoded.handle { signedInHandleBluesky = h }
+            // Ensure DID is populated post-refresh
+            await populateBlueskyIdentityIfNeeded()
             return true
         } catch {
             return false
         }
+    }
+
+    private func populateBlueskyIdentityIfNeeded() async {
+        guard let client = blueskyClient, client.did == nil else { return }
+        var url = client.pdsURL; url.append(path: "/xrpc/com.atproto.server.getSession")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(client.accessToken)", forHTTPHeaderField: "Authorization")
+        struct SessionResp: Decodable { let did: String; let handle: String }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return }
+            let decoded = try JSONDecoder().decode(SessionResp.self, from: data)
+            blueskyDid = decoded.did
+            var updated = client
+            updated.did = decoded.did
+            blueskyClient = updated
+            signedInHandleBluesky = decoded.handle
+        } catch { /* ignore */ }
     }
 
     // MARK: - Sign out
@@ -122,5 +149,19 @@ final class SessionStore {
         signedInHandleMastodon = nil
         Keychain.delete(service: KC_SERVICE, account: KC_MASTO_TOKEN)
         UserDefaults.standard.removeObject(forKey: UD_MASTO_BASE)
+    }
+
+    // MARK: - Shared post state helpers
+    func state(for post: UnifiedPost) -> PostInteractionState {
+        if let s = postStates[post.id] { return s }
+        let s = PostInteractionState.fromPost(post)
+        postStates[post.id] = s
+        return s
+    }
+
+    func updateState(for postID: String, _ mutate: (inout PostInteractionState) -> Void) {
+        var s = postStates[postID] ?? PostInteractionState(isLiked: false, isReposted: false, isBookmarked: false, likeCount: 0, repostCount: 0, bskyLikeRkey: nil, bskyRepostRkey: nil)
+        mutate(&s)
+        postStates[postID] = s
     }
 }

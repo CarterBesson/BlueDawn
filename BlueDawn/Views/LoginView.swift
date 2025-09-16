@@ -128,9 +128,10 @@ struct LoginView: View {
             }
 
             let sessionResp = try JSONDecoder().decode(CreateSessionResp.self, from: data)
-            session.blueskyClient = BlueskyClient(pdsURL: serviceURL, accessToken: sessionResp.accessJwt)
+            session.blueskyClient = BlueskyClient(pdsURL: serviceURL, accessToken: sessionResp.accessJwt, did: sessionResp.did)
             session.isBlueskySignedIn = true
             session.signedInHandleBluesky = sessionResp.handle
+            session.blueskyDid = sessionResp.did
 
             bskyAppPassword = ""
         } catch {
