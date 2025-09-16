@@ -1,6 +1,7 @@
 import SwiftUI
 
 private struct SessionKey: EnvironmentKey {
+    @MainActor
     static let defaultValue: SessionStore = SessionStore()
 }
 

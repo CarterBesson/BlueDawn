@@ -231,6 +231,9 @@ struct MastodonClient: SocialClient {
             account: s.account,
             media_attachments: s.media_attachments
         )
+        let isBoost = (s.reblog != nil)
+        let boostedName = isBoost ? (s.account.display_name.isEmpty ? nil : s.account.display_name) : nil
+        let boostedHandle = isBoost ? s.account.acct : nil
 
         let created = parseISO8601(src.created_at) ?? Date()
         let text: AttributedString = HTML.toAttributed(src.content)
@@ -264,11 +267,17 @@ struct MastodonClient: SocialClient {
             cwOrLabels: cwLabels,
             counts: PostCounts(replies: s.replies_count, boostsReposts: s.reblogs_count, favLikes: s.favourites_count),
             inReplyToID: src.in_reply_to_id,
+<<<<<<< HEAD
             isRepostOrBoost: s.reblog != nil,
             bskyCID: nil,
             isLiked: s.favourited ?? false,
             isReposted: s.reblogged ?? false,
             isBookmarked: s.bookmarked ?? false
+=======
+            isRepostOrBoost: isBoost,
+            boostedByHandle: boostedHandle,
+            boostedByDisplayName: boostedName
+>>>>>>> main
         )
     }
 
