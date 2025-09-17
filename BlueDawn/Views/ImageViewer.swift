@@ -24,6 +24,11 @@ struct ImageViewer: View {
     private let dismissThreshold: CGFloat = 140
     @Environment(\.dismiss) private var dismiss
 
+    private enum UI {
+        static let controlSize: CGFloat = 36
+        static let iconSize: CGFloat = 17
+    }
+
     init(post: UnifiedPost, startIndex: Int) {
         self.post = post
         _index = State(initialValue: startIndex)
@@ -73,42 +78,49 @@ struct ImageViewer: View {
                 )
             }
 
-            VStack {
-                HStack {
-                    Spacer()
-                    if let alt = currentAltText, !alt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Button { withAnimation(.snappy) { showAltText.toggle() } } label: {
-                            Image(systemName: "text.alignleft")
-                                .font(.system(size: 24, weight: .semibold))
-                                .foregroundStyle(.white.opacity(0.9))
-                                .shadow(radius: 2)
+            VStack(spacing: 0) {
+                ZStack(alignment: .trailing) {
+                    // top gradient scrim for button contrast
+                    LinearGradient(colors: [Color.black.opacity(0.6), Color.black.opacity(0.0)],
+                                   startPoint: .top, endPoint: .bottom)
+                        .frame(height: 100)
+                        .frame(maxWidth: .infinity)
+                        .ignoresSafeArea(edges: .top)
+
+                    HStack(spacing: 8) {
+                        Spacer()
+
+                        if let alt = currentAltText, !alt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            controlButton("text.alignleft", label: showAltText ? "Hide alt text" : "Show alt text") {
+                                withAnimation(.snappy) { showAltText.toggle() }
+                            }
                         }
-                        .accessibilityLabel(showAltText ? "Hide alt text" : "Show alt text")
-                        .padding(.trailing, 8)
+
+                        controlButton("ellipsis", label: "More options") {
+                            showActions = true
+                        }
+
+                        if isDownloading {
+                            ProgressView()
+                                .tint(.white)
+                                .frame(width: UI.controlSize, height: UI.controlSize)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .shadow(radius: 1.5)
+                        }
+
+                        controlButton("xmark", label: "Close") {
+                            dismiss()
+                        }
                     }
-                    Button { showActions = true } label: {
-                        Image(systemName: "ellipsis.circle")
-                            .font(.system(size: 26, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.95))
-                            .shadow(radius: 2)
-                    }
-                    .padding(.trailing, 8)
-                    .accessibilityLabel("More options")
-                    if isDownloading {
-                        ProgressView().tint(.white).padding(.trailing, 4)
-                    }
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 28, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .shadow(radius: 2)
-                    }
-                    .padding(.top, 16)
-                    .padding(.trailing, 16)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
                 }
+
                 Spacer()
             }
-            .opacity(1 - min(Double(abs(dragY)) / 160.0, 1.0))
+            .opacity(controlsOpacity)
+            .animation(.easeInOut(duration: 0.18), value: isZoomed)
+            .allowsHitTesting(!isZoomed)
 
             // Alt text overlay
             if showAltText {
@@ -141,6 +153,20 @@ struct ImageViewer: View {
         }
     }
 
+    @ViewBuilder
+    private func controlButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: UI.iconSize, weight: .semibold))
+                .frame(width: UI.controlSize, height: UI.controlSize)
+                .foregroundStyle(.white)
+                .background(.ultraThinMaterial, in: Circle())
+                .shadow(radius: 1.5)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
     private var backgroundOpacity: Double {
         let progress = min(Double(abs(dragY)) / 400.0, 1.0)
         return max(0.3, 1 - progress)
@@ -150,6 +176,11 @@ struct ImageViewer: View {
         let denom: CGFloat = 1000
         let limit: CGFloat = 0.1
         return min(abs(dragY) / denom, limit)
+    }
+
+    private var controlsOpacity: Double {
+        let drag = 1 - min(Double(abs(dragY)) / 160.0, 1.0)
+        return drag * (isZoomed ? 0.0 : 1.0)
     }
 
     private var currentAltText: String? {
@@ -285,28 +316,40 @@ private struct AltTextOverlay: View {
     let text: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Alt Text")
-                .font(.headline)
-                .foregroundStyle(.white.opacity(0.95))
+        VStack(spacing: 12) {
+            // grabber
+            Capsule()
+                .fill(Color.white.opacity(0.35))
+                .frame(width: 36, height: 4)
+                .padding(.top, 4)
+
+            HStack {
+                Text("Alt Text")
+                    .font(.headline)
+                    .foregroundStyle(.white.opacity(0.95))
+                Spacer()
+            }
+
             ScrollView {
                 Text(displayText)
                     .font(.body)
                     .foregroundStyle(.white.opacity(0.95))
+                    .lineSpacing(2)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxHeight: 180)
+            .frame(maxHeight: 220)
         }
         .padding(16)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color.black.opacity(0.65))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
-                )
+                .fill(.ultraThinMaterial)
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+        )
+        .shadow(radius: 8)
     }
 
     private var displayText: String {
