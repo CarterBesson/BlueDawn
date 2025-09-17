@@ -1,4 +1,8 @@
 import SwiftUI
+import Photos
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct ImageViewerState: Identifiable {
     let id = UUID()
@@ -12,6 +16,11 @@ struct ImageViewer: View {
     @State private var dragY: CGFloat = 0
     @State private var isZoomed: Bool = false
     @State private var showAltText: Bool = false
+    @State private var showActions: Bool = false
+    @State private var isDownloading: Bool = false
+    @State private var showAlert: Bool = false
+    @State private var alertTitle: String = ""
+    @State private var alertMessage: String = ""
     private let dismissThreshold: CGFloat = 140
     @Environment(\.dismiss) private var dismiss
 
@@ -77,6 +86,17 @@ struct ImageViewer: View {
                         .accessibilityLabel(showAltText ? "Hide alt text" : "Show alt text")
                         .padding(.trailing, 8)
                     }
+                    Button { showActions = true } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .font(.system(size: 26, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.95))
+                            .shadow(radius: 2)
+                    }
+                    .padding(.trailing, 8)
+                    .accessibilityLabel("More options")
+                    if isDownloading {
+                        ProgressView().tint(.white).padding(.trailing, 4)
+                    }
                     Button { dismiss() } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 28, weight: .semibold))
@@ -102,6 +122,23 @@ struct ImageViewer: View {
                 .ignoresSafeArea()
             }
         }
+        .confirmationDialog("Image Options", isPresented: $showActions, titleVisibility: .visible) {
+            Button("Download Image") { Task { await downloadCurrentImage() } }
+            Button("Share Image") {
+                // Stub: not implemented yet
+                Haptics.notify(.warning)
+                alertTitle = "Not Implemented"
+                alertMessage = "Sharing will be added soon."
+                showAlert = true
+            }
+            .disabled(true)
+            Button("Cancel", role: .cancel) { }
+        }
+        .alert(alertTitle, isPresented: $showAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(alertMessage)
+        }
     }
 
     private var backgroundOpacity: Double {
@@ -118,6 +155,68 @@ struct ImageViewer: View {
     private var currentAltText: String? {
         guard post.media.indices.contains(index) else { return nil }
         return post.media[index].altText
+    }
+
+    private var currentURL: URL? {
+        guard post.media.indices.contains(index) else { return nil }
+        return post.media[index].url
+    }
+
+    @MainActor
+    private func downloadCurrentImage() async {
+        guard let url = currentURL else {
+            Haptics.notify(.error)
+            alertTitle = "Save Failed"
+            alertMessage = "Unable to determine image URL."
+            showAlert = true
+            return
+        }
+        isDownloading = true
+        defer { isDownloading = false }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            guard let image = UIImage(data: data) else { throw NSError(domain: "Image", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid image data"]) }
+            try await saveToPhotos(image)
+            Haptics.notify(.success)
+            alertTitle = "Saved"
+            alertMessage = "Image saved to your Photos."
+            showAlert = true
+        } catch {
+            Haptics.notify(.error)
+            alertTitle = "Save Failed"
+            alertMessage = error.localizedDescription
+            showAlert = true
+        }
+    }
+
+    private func saveToPhotos(_ image: UIImage) async throws {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        let finalStatus: PHAuthorizationStatus
+        if status == .notDetermined {
+            finalStatus = await requestPhotosAddOnlyAuthorization()
+        } else {
+            finalStatus = status
+        }
+        guard finalStatus == .authorized || finalStatus == .limited else {
+            throw NSError(domain: "Photos", code: 1, userInfo: [NSLocalizedDescriptionKey: "Photos permission not granted."])
+        }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }, completionHandler: { success, error in
+                if let error = error { cont.resume(throwing: error) }
+                else if success { cont.resume(returning: ()) }
+                else { cont.resume(throwing: NSError(domain: "Photos", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unknown save error"])) }
+            })
+        }
+    }
+
+    private func requestPhotosAddOnlyAuthorization() async -> PHAuthorizationStatus {
+        await withCheckedContinuation { cont in
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                cont.resume(returning: status)
+            }
+        }
     }
 }
 
