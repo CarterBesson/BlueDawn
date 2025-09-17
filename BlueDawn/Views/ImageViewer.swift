@@ -11,6 +11,7 @@ struct ImageViewer: View {
     @State var index: Int
     @State private var dragY: CGFloat = 0
     @State private var isZoomed: Bool = false
+    @State private var showAltText: Bool = false
     private let dismissThreshold: CGFloat = 140
     @Environment(\.dismiss) private var dismiss
 
@@ -32,9 +33,10 @@ struct ImageViewer: View {
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .automatic))
-                // Reset zoom state when changing pages so gestures behave predictably
+                // Reset zoom/alt state when changing pages so gestures behave predictably
                 .onChange(of: index) { _, _ in
                     isZoomed = false
+                    showAltText = false
                 }
                 .offset(y: dragY)
                 .scaleEffect(1 - dragShrink)
@@ -65,6 +67,16 @@ struct ImageViewer: View {
             VStack {
                 HStack {
                     Spacer()
+                    if let alt = currentAltText, !alt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Button { withAnimation(.snappy) { showAltText.toggle() } } label: {
+                            Image(systemName: "text.alignleft")
+                                .font(.system(size: 24, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.9))
+                                .shadow(radius: 2)
+                        }
+                        .accessibilityLabel(showAltText ? "Hide alt text" : "Show alt text")
+                        .padding(.trailing, 8)
+                    }
                     Button { dismiss() } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 28, weight: .semibold))
@@ -77,6 +89,18 @@ struct ImageViewer: View {
                 Spacer()
             }
             .opacity(1 - min(Double(abs(dragY)) / 160.0, 1.0))
+
+            // Alt text overlay
+            if showAltText {
+                VStack {
+                    Spacer()
+                    AltTextOverlay(text: currentAltText)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 24)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                .ignoresSafeArea()
+            }
         }
     }
 
@@ -89,6 +113,11 @@ struct ImageViewer: View {
         let denom: CGFloat = 1000
         let limit: CGFloat = 0.1
         return min(abs(dragY) / denom, limit)
+    }
+
+    private var currentAltText: String? {
+        guard post.media.indices.contains(index) else { return nil }
+        return post.media[index].altText
     }
 }
 
@@ -151,4 +180,38 @@ struct ZoomableAsyncImage: View {
     }
 
     private func clamp(_ v: CGFloat) -> CGFloat { min(max(v, 1), 4) }
+}
+
+private struct AltTextOverlay: View {
+    let text: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Alt Text")
+                .font(.headline)
+                .foregroundStyle(.white.opacity(0.95))
+            ScrollView {
+                Text(displayText)
+                    .font(.body)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 180)
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.black.opacity(0.65))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                )
+        )
+    }
+
+    private var displayText: String {
+        let trimmed = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "No alt text provided." : trimmed
+    }
 }
