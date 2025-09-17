@@ -32,9 +32,13 @@ struct ImageViewer: View {
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .automatic))
+                // Reset zoom state when changing pages so gestures behave predictably
+                .onChange(of: index) { _, _ in
+                    isZoomed = false
+                }
                 .offset(y: dragY)
                 .scaleEffect(1 - dragShrink)
-                .highPriorityGesture(
+                .simultaneousGesture(
                     DragGesture(minimumDistance: 10, coordinateSpace: .local)
                         .onChanged { value in
                             guard !isZoomed else { return }
@@ -117,6 +121,8 @@ struct ZoomableAsyncImage: View {
                 }
                 .frame(maxWidth: geo.size.width, maxHeight: geo.size.height)
             }
+            // Allow TabView page swipe to work when not zoomed
+            .scrollDisabled(!isZoomed)
             .frame(width: geo.size.width, height: geo.size.height)
             .background(Color.black)
         }
