@@ -101,11 +101,12 @@ struct PostDetailView: View {
                 repliesSection
                     .animation(nil, value: viewModel.items.count)
                 }
-                .padding(.horizontal, 16)
                 .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .scrollTargetLayout()
-                .scrollTargetBehavior(.viewAligned)
             }
+            .contentMargins(.horizontal, 16)
+            .scrollTargetBehavior(.viewAligned)
             .scrollPosition(id: $initialPosition, anchor: .top)
             .navigationTitle("Post")
             .navigationBarTitleDisplayMode(.inline)
