@@ -11,8 +11,7 @@ struct QuotedPostCard: View {
                 Button {
                     onOpenProfile?(post.network, post.authorHandle)
                 } label: {
-                    AvatarCircle(handle: post.authorHandle, url: post.authorAvatarURL)
-                        .frame(width: 28, height: 28)
+                    AvatarCircle(handle: post.authorHandle, url: post.authorAvatarURL, size: 22)
                 }
                 .buttonStyle(.plain)
 
