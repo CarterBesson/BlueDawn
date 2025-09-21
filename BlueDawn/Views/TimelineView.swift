@@ -58,6 +58,7 @@ struct HomeTimelineView: View {
                 }
             }
         )
+        .navigationTitle("Home")
         .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
             ImageViewer(post: selection.post, startIndex: selection.index)
         }
@@ -73,13 +74,31 @@ struct HomeTimelineView: View {
             ProfileView(network: route.network, handle: route.handle, session: session)
         }
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                NavigationLink {
-                    SettingsView()
+            ToolbarItem(placement: .topBarLeading) {
+                // Profile avatar with quick actions
+                Menu {
+                    if let h = session.signedInHandleBluesky {
+                        Button("View Profile") {
+                            profileRoute = ProfileRoute(network: .bluesky, handle: h)
+                        }
+                    } else if let h = session.signedInHandleMastodon {
+                        Button("View Profile") {
+                            if let client = session.mastodonClient {
+                                let instance = client.baseURL.host ?? client.baseURL.absoluteString
+                                profileRoute = ProfileRoute(network: .mastodon(instance: instance), handle: h)
+                            }
+                        }
+                    }
+                    NavigationLink(destination: SettingsView()) {
+                        Label("Settings", systemImage: "gearshape")
+                    }
                 } label: {
-                    Image(systemName: "gearshape")
-                        .imageScale(.large)
-                        .accessibilityLabel("Settings")
+                    AvatarCircle(
+                        handle: session.selectedHandle ?? "?",
+                        url: session.selectedAvatarURL,
+                        size: 28
+                    )
+                    .accessibilityLabel("Profile")
                 }
             }
         }

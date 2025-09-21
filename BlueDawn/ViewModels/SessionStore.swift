@@ -14,6 +14,23 @@ final class SessionStore {
     var blueskyDid: String?
     // Shared per-post interaction cache
     var postStates: [String: PostInteractionState] = [:]
+    // Current user avatars (populated on sign-in/restore)
+    var avatarURLBluesky: URL? = nil
+    var avatarURLMastodon: URL? = nil
+
+    enum AvatarSource: String, CaseIterable, Identifiable {
+        case auto
+        case bluesky
+        case mastodon
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .auto: return "Auto"
+            case .bluesky: return "Bluesky"
+            case .mastodon: return "Mastodon"
+            }
+        }
+    }
 
     // MARK: - Persistence keys
     private let KC_SERVICE = "BlueDawn"
@@ -26,6 +43,7 @@ final class SessionStore {
     private let KC_MASTO_TOKEN = "mastodon.token"
     private let UD_MASTO_BASE  = "bd.mastodon.base"
     private let UD_OPEN_LINKS_IN_APP = "bd.links.inApp"
+    private let UD_PROFILE_AVATAR_SOURCE = "bd.avatar.source"
 
     // MARK: - JWT helpers
     private func jwtExpirationDate(_ jwt: String) -> Date? {
@@ -54,6 +72,39 @@ final class SessionStore {
         return UserDefaults.standard.bool(forKey: key)
     }() {
         didSet { UserDefaults.standard.set(openLinksInApp, forKey: UD_OPEN_LINKS_IN_APP) }
+    }
+
+    // Which account's avatar to show in UI
+    var avatarSourcePreference: AvatarSource = {
+        if let raw = UserDefaults.standard.string(forKey: "bd.avatar.source"), let v = AvatarSource(rawValue: raw) {
+            return v
+        }
+        return .auto
+    }() {
+        didSet { UserDefaults.standard.set(avatarSourcePreference.rawValue, forKey: UD_PROFILE_AVATAR_SOURCE) }
+    }
+
+    // Helpers for UI bindings
+    var selectedAvatarURL: URL? {
+        switch avatarSourcePreference {
+        case .auto:
+            return avatarURLBluesky ?? avatarURLMastodon
+        case .bluesky:
+            return avatarURLBluesky
+        case .mastodon:
+            return avatarURLMastodon
+        }
+    }
+
+    var selectedHandle: String? {
+        switch avatarSourcePreference {
+        case .auto:
+            return signedInHandleBluesky ?? signedInHandleMastodon
+        case .bluesky:
+            return signedInHandleBluesky
+        case .mastodon:
+            return signedInHandleMastodon
+        }
     }
 
     private func isExpiringSoon(_ jwt: String, within seconds: TimeInterval = 300) -> Bool {
@@ -96,6 +147,7 @@ final class SessionStore {
             }
             // Populate identity (DID/handle) for features that require it
             await populateBlueskyIdentityIfNeeded()
+            await refreshOwnAvatars()
         }
 
         // Mastodon
@@ -105,7 +157,9 @@ final class SessionStore {
             mastodonClient = MastodonClient(baseURL: baseURL, accessToken: token)
             isMastodonSignedIn = true
             await populateMastodonIdentityIfNeeded()
+            await refreshOwnAvatars()
         }
+        ensureValidAvatarPreference()
     }
 
     // MARK: - Set sessions
@@ -119,6 +173,7 @@ final class SessionStore {
         isBlueskySignedIn = true
         signedInHandleBluesky = handle
         blueskyDid = did
+        Task { await refreshOwnAvatars() }
     }
 
     func setMastodonSession(baseURL: URL, accessToken: String) {
@@ -128,7 +183,26 @@ final class SessionStore {
         mastodonClient = MastodonClient(baseURL: baseURL, accessToken: accessToken)
         isMastodonSignedIn = true
         // Populate identity in the background for self detection
-        Task { await populateMastodonIdentityIfNeeded() }
+        Task {
+            await populateMastodonIdentityIfNeeded()
+            await refreshOwnAvatars()
+        }
+    }
+
+    // Refresh the cached avatars for signed-in accounts
+    func refreshOwnAvatars() async {
+        // Bluesky
+        if let client = blueskyClient, let handle = signedInHandleBluesky, !handle.isEmpty {
+            if let user = try? await client.fetchUserProfile(handle: handle) {
+                avatarURLBluesky = user.avatarURL
+            }
+        }
+        // Mastodon
+        if let client = mastodonClient, let handle = signedInHandleMastodon, !handle.isEmpty {
+            if let user = try? await client.fetchUserProfile(handle: handle) {
+                avatarURLMastodon = user.avatarURL
+            }
+        }
     }
 
     /// Attempts to refresh the Bluesky session using the saved refresh JWT.
@@ -229,6 +303,8 @@ final class SessionStore {
         Keychain.delete(service: KC_SERVICE, account: KC_BSKY_REFRESH)
         UserDefaults.standard.removeObject(forKey: UD_BSKY_PDS)
         UserDefaults.standard.removeObject(forKey: UD_BSKY_HANDLE)
+        avatarURLBluesky = nil
+        if avatarSourcePreference == .bluesky { avatarSourcePreference = .auto }
     }
 
     func signOutMastodon() {
@@ -237,6 +313,8 @@ final class SessionStore {
         signedInHandleMastodon = nil
         Keychain.delete(service: KC_SERVICE, account: KC_MASTO_TOKEN)
         UserDefaults.standard.removeObject(forKey: UD_MASTO_BASE)
+        avatarURLMastodon = nil
+        if avatarSourcePreference == .mastodon { avatarSourcePreference = .auto }
     }
 
     /// Call this before performing an API call to ensure the token is fresh.
@@ -256,5 +334,16 @@ final class SessionStore {
         var s = postStates[postID] ?? PostInteractionState(isLiked: false, isReposted: false, isBookmarked: false, likeCount: 0, repostCount: 0, bskyLikeRkey: nil, bskyRepostRkey: nil)
         mutate(&s)
         postStates[postID] = s
+    }
+
+    private func ensureValidAvatarPreference() {
+        switch avatarSourcePreference {
+        case .auto:
+            break
+        case .bluesky:
+            if !isBlueskySignedIn { avatarSourcePreference = .auto }
+        case .mastodon:
+            if !isMastodonSignedIn { avatarSourcePreference = .auto }
+        }
     }
 }

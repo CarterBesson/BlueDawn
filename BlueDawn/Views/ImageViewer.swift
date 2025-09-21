@@ -20,6 +20,7 @@ struct ImageViewer: View {
     @State private var showAlert: Bool = false
     @State private var alertTitle: String = ""
     @State private var alertMessage: String = ""
+    @State private var showActions: Bool = false
     private let dismissThreshold: CGFloat = 140
     @Environment(\.dismiss) private var dismiss
 
@@ -95,21 +96,8 @@ struct ImageViewer: View {
                             }
                         }
 
-                        Menu {
-                            Button {
-                                Task { await downloadCurrentImage() }
-                            } label: {
-                                Label("Download Image", systemImage: "arrow.down.circle")
-                            }
-                            Button {
-                                Haptics.notify(.warning)
-                                alertTitle = "Not Implemented"
-                                alertMessage = "Sharing will be added soon."
-                                showAlert = true
-                            } label: {
-                                Label("Share Image", systemImage: "square.and.arrow.up")
-                            }
-                            .disabled(true)
+                        Button {
+                            showActions = true
                         } label: {
                             Image(systemName: "ellipsis")
                                 .font(.system(size: UI.iconSize, weight: .semibold))
@@ -158,6 +146,19 @@ struct ImageViewer: View {
             Button("OK", role: .cancel) { }
         } message: {
             Text(alertMessage)
+        }
+        .confirmationDialog("Image options", isPresented: $showActions, titleVisibility: .visible) {
+            Button("Download Image") {
+                Task { await downloadCurrentImage() }
+            }
+            Button("Share Image") {
+                Haptics.notify(.warning)
+                alertTitle = "Not Implemented"
+                alertMessage = "Sharing will be added soon."
+                showAlert = true
+            }
+            .disabled(true)
+            Button("Cancel", role: .cancel) { }
         }
     }
 
