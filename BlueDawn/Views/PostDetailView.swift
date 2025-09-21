@@ -8,6 +8,7 @@ struct PostDetailView: View {
     @State private var initialPosition: String? = "focusedPost"
     @State private var imageViewer: ImageViewerState? = nil
     @State private var profileRoute: ProfileRoute? = nil
+    @State private var safariURL: URL? = nil
 
     private struct ProfileRoute: Identifiable, Hashable {
         let id = UUID()
@@ -119,12 +120,26 @@ struct PostDetailView: View {
                         profileRoute = ProfileRoute(network: .bluesky, handle: handle)
                         return .handled
                     }
+                    // Non-profile web links
+                    if session.openLinksInApp {
+                        #if canImport(SafariServices) && canImport(UIKit)
+                        safariURL = url
+                        return .handled
+                        #else
+                        return .systemAction
+                        #endif
+                    }
                 }
                 return .systemAction
             })
             .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
                 ImageViewer(post: selection.post, startIndex: selection.index)
             }
+            #if canImport(SafariServices)
+            .sheet(isPresented: Binding(get: { safariURL != nil }, set: { if !$0 { safariURL = nil } })) {
+                if let url = safariURL { SafariView(url: url) }
+            }
+            #endif
             .task {
                 await viewModel.load()
             }

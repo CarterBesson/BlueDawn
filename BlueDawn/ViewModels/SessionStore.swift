@@ -25,6 +25,7 @@ final class SessionStore {
 
     private let KC_MASTO_TOKEN = "mastodon.token"
     private let UD_MASTO_BASE  = "bd.mastodon.base"
+    private let UD_OPEN_LINKS_IN_APP = "bd.links.inApp"
 
     // MARK: - JWT helpers
     private func jwtExpirationDate(_ jwt: String) -> Date? {
@@ -43,6 +44,16 @@ final class SessionStore {
         if let exp = json["exp"] as? Double { return Date(timeIntervalSince1970: exp) }
         if let expInt = json["exp"] as? Int { return Date(timeIntervalSince1970: TimeInterval(expInt)) }
         return nil
+    }
+
+    // MARK: - App settings
+    // Default to true unless explicitly set
+    var openLinksInApp: Bool = {
+        let key = "bd.links.inApp"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }() {
+        didSet { UserDefaults.standard.set(openLinksInApp, forKey: UD_OPEN_LINKS_IN_APP) }
     }
 
     private func isExpiringSoon(_ jwt: String, within seconds: TimeInterval = 300) -> Bool {

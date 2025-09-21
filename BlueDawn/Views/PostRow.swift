@@ -7,6 +7,8 @@ struct PostRow: View {
     var onOpenProfile: ((Network, String) -> Void)? = nil
     // New: notify parent when an image is tapped (post + index within post.media)
     var onTapImage: ((UnifiedPost, Int) -> Void)? = nil
+    // Notify parent when an external web URL should be opened (non-profile links)
+    var onOpenExternalURL: ((URL) -> Void)? = nil
 
     @ViewBuilder private var shareBanner: some View {
         if post.isRepostOrBoost, let name = post.boostedByDisplayName ?? post.boostedByHandle {
@@ -383,6 +385,16 @@ private extension PostRow {
             if host == "bsky.app" && path.hasPrefix("/profile/") {
                 let handle = String(path.dropFirst("/profile/".count))
                 if !handle.isEmpty { onOpenProfile?(.bluesky, handle); return .handled }
+            }
+        }
+
+        // For other web links, open either in-app Safari or system browser
+        if let scheme = url.scheme, (scheme == "https" || scheme == "http") {
+            if session.openLinksInApp {
+                onOpenExternalURL?(url)
+                return .handled
+            } else {
+                return .systemAction
             }
         }
 

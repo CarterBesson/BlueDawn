@@ -6,6 +6,7 @@ struct TimelineRow: View {
     let onOpenPost: (UnifiedPost) -> Void
     let onOpenProfile: (Network, String) -> Void
     let onTapImage: (UnifiedPost, Int) -> Void
+    let onOpenExternalURL: (URL) -> Void
 
     var body: some View {
         Group {
@@ -17,7 +18,8 @@ struct TimelineRow: View {
                     session: session,
                     onOpenProfile: onOpenProfile,
                     onOpenPost: onOpenPost,
-                    onTapImage: onTapImage
+                    onTapImage: onTapImage,
+                    onOpenExternalURL: onOpenExternalURL
                 )
             } else {
                 // Show regular post; use programmatic navigation to avoid nested link issues
@@ -31,7 +33,8 @@ struct TimelineRow: View {
                         post: post,
                         showAvatar: false,
                         onOpenProfile: onOpenProfile,
-                        onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) }
+                        onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) },
+                        onOpenExternalURL: onOpenExternalURL
                     )
                     .contentShape(Rectangle())
                     .onTapGesture { onOpenPost(post) }

@@ -19,6 +19,7 @@ struct HomeTimelineView: View {
     @State private var jumpInProgress = false
     @State private var imageViewer: ImageViewerState? = nil
     @State private var postSelection: UnifiedPost? = nil
+    @State private var safariURL: URL? = nil
 
     private struct ProfileRoute: Identifiable, Hashable {
         let id = UUID()
@@ -44,6 +45,11 @@ struct HomeTimelineView: View {
                 profileRoute = ProfileRoute(network: network, handle: handle)
             },
             onTapImage: { tappedPost, idx in imageViewer = ImageViewerState(post: tappedPost, index: idx) },
+            onOpenExternalURL: { url in
+                #if canImport(SafariServices) && canImport(UIKit)
+                safariURL = url
+                #endif
+            },
             onRefresh: { await viewModel.refresh() },
             onUpdateAnchor: { items in
                 // Choose first item in on-screen order whose id is visible
@@ -55,6 +61,11 @@ struct HomeTimelineView: View {
         .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
             ImageViewer(post: selection.post, startIndex: selection.index)
         }
+        #if canImport(SafariServices) && canImport(UIKit)
+        .sheet(isPresented: Binding(get: { safariURL != nil }, set: { if !$0 { safariURL = nil } })) {
+            if let url = safariURL { SafariView(url: url) }
+        }
+        #endif
         .navigationDestination(item: $postSelection) { post in
             PostDetailView(post: post, viewModel: ThreadViewModel(session: session, root: post))
         }
@@ -89,6 +100,7 @@ struct TimelineList: View {
     @Binding var jumpInProgress: Bool
     let onOpenProfile: (Network, String) -> Void
     let onTapImage: (UnifiedPost, Int) -> Void
+    let onOpenExternalURL: (URL) -> Void
     let onRefresh: () async -> Void
     let onUpdateAnchor: ([UnifiedPost]) -> Void
 
@@ -101,7 +113,8 @@ struct TimelineList: View {
                         session: session,
                         onOpenPost: onOpenPost,
                         onOpenProfile: onOpenProfile,
-                        onTapImage: onTapImage
+                        onTapImage: onTapImage,
+                        onOpenExternalURL: onOpenExternalURL
                     )
                     .id(post.id)
                     .onAppear {
