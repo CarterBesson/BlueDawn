@@ -60,6 +60,20 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                Section("Playback") {
+                    Toggle(isOn: Binding(get: { session.videoStartMuted }, set: { session.videoStartMuted = $0 })) {
+                        Label("Start videos muted", systemImage: "speaker.slash")
+                    }
+
+                    Toggle(isOn: Binding(get: { session.videoAutoplay }, set: { session.videoAutoplay = $0 })) {
+                        Label("Autoplay videos", systemImage: "play.circle")
+                    }
+
+                    Toggle(isOn: Binding(get: { session.videoLoop }, set: { session.videoLoop = $0 })) {
+                        Label("Loop videos & GIFs", systemImage: "repeat")
+                    }
+                }
             }
             .navigationTitle("Settings")
         }

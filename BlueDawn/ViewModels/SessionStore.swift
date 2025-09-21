@@ -44,6 +44,9 @@ final class SessionStore {
     private let UD_MASTO_BASE  = "bd.mastodon.base"
     private let UD_OPEN_LINKS_IN_APP = "bd.links.inApp"
     private let UD_PROFILE_AVATAR_SOURCE = "bd.avatar.source"
+    private let UD_VIDEO_START_MUTED = "bd.video.startMuted"
+    private let UD_VIDEO_AUTOPLAY = "bd.video.autoplay"
+    private let UD_VIDEO_LOOP = "bd.video.loop"
 
     // MARK: - JWT helpers
     private func jwtExpirationDate(_ jwt: String) -> Date? {
@@ -72,6 +75,33 @@ final class SessionStore {
         return UserDefaults.standard.bool(forKey: key)
     }() {
         didSet { UserDefaults.standard.set(openLinksInApp, forKey: UD_OPEN_LINKS_IN_APP) }
+    }
+
+    // Whether videos should start muted by default
+    var videoStartMuted: Bool = {
+        let key = "bd.video.startMuted"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }() {
+        didSet { UserDefaults.standard.set(videoStartMuted, forKey: UD_VIDEO_START_MUTED) }
+    }
+
+    // Autoplay videos when the view appears
+    var videoAutoplay: Bool = {
+        let key = "bd.video.autoplay"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }() {
+        didSet { UserDefaults.standard.set(videoAutoplay, forKey: UD_VIDEO_AUTOPLAY) }
+    }
+
+    // Loop videos and GIFs when they reach the end
+    var videoLoop: Bool = {
+        let key = "bd.video.loop"
+        if UserDefaults.standard.object(forKey: key) == nil { return true }
+        return UserDefaults.standard.bool(forKey: key)
+    }() {
+        didSet { UserDefaults.standard.set(videoLoop, forKey: UD_VIDEO_LOOP) }
     }
 
     // Which account's avatar to show in UI

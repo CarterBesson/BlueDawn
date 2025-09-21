@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PostRow: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.openURL) private var openURL
     let post: UnifiedPost
     var showAvatar: Bool = true
     var onOpenProfile: ((Network, String) -> Void)? = nil
@@ -82,6 +83,15 @@ struct PostRow: View {
             crossPostBadge
             header
             content
+            if let link = firstExternalLink, !hasAnyMedia {
+                // Tappable rich link preview (uses environment openURL handler)
+                Button {
+                    _ = openURL(link)
+                } label: {
+                    LinkPreviewView(url: link)
+                }
+                .buttonStyle(.plain)
+            }
             if let quoted = post.quotedPost {
                 QuotedPostCard(post: quoted, onOpenPost: { q in onOpenPost?(q) }, onOpenProfile: onOpenProfile)
             }
@@ -156,33 +166,52 @@ struct PostRow: View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(spacing: 8) {
                 ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
-                    Button {
-                        onTapImage?(post, idx)
-                    } label: {
-                        AsyncImage(url: m.url) { phase in
-                            switch phase {
-                            case .empty:
-                                Rectangle().fill(Color.secondary.opacity(0.1))
-                                    .overlay(ProgressView())
-                            case .success(let image):
-                                image.resizable().scaledToFill()
-                            case .failure:
-                                Rectangle().fill(Color.secondary.opacity(0.15))
-                                    .overlay(Image(systemName: "photo").font(.title3))
-                            @unknown default:
-                                Rectangle().fill(Color.secondary.opacity(0.15))
+                    Group {
+                        switch m.kind {
+                        case .image:
+                            Button { onTapImage?(post, idx) } label: {
+                                AsyncImage(url: m.url) { phase in
+                                    switch phase {
+                                    case .empty:
+                                        Rectangle().fill(Color.secondary.opacity(0.1))
+                                            .overlay(ProgressView())
+                                    case .success(let image):
+                                        image.resizable().scaledToFill()
+                                    case .failure:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                            .overlay(Image(systemName: "photo").font(.title3))
+                                    @unknown default:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                    }
+                                }
                             }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(m.altText ?? "Image")
+                        case .video, .gif:
+                            InlineVideoView(url: m.url)
+                                .overlay(alignment: .bottomTrailing) {
+                                    Button {
+                                        NotificationCenter.default.post(name: Notification.Name("InlineVideoPauseAll"), object: nil)
+                                        onTapImage?(post, idx)
+                                    } label: {
+                                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .padding(6)
+                                            .background(.ultraThinMaterial, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .padding(6)
+                                    .accessibilityLabel("Open full screen")
+                                }
+                                .accessibilityLabel(m.altText ?? "Video")
                         }
-                        .frame(width: 160, height: 120)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-                        )
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(m.altText ?? "Image")
+                    .frame(width: 160, height: 120)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
+                    )
                 }
             }
             .padding(.top, 4)
@@ -358,6 +387,18 @@ struct PostRow: View {
         case .mastodon: return "dot.radiowaves.left.and.right"
         }
     }
+
+    // First external http(s) link in the attributed text
+    private var firstExternalLink: URL? {
+        for run in post.text.runs {
+            if let url = run.link, let scheme = url.scheme?.lowercased(), (scheme == "http" || scheme == "https") {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private var hasAnyMedia: Bool { !post.media.isEmpty }
 
     private func relativeDate(_ date: Date) -> String {
         let f = RelativeDateTimeFormatter()
