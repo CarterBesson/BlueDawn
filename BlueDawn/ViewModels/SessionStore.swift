@@ -104,6 +104,7 @@ final class SessionStore {
            let baseURL = URL(string: baseString) {
             mastodonClient = MastodonClient(baseURL: baseURL, accessToken: token)
             isMastodonSignedIn = true
+            await populateMastodonIdentityIfNeeded()
         }
     }
 
@@ -126,6 +127,8 @@ final class SessionStore {
 
         mastodonClient = MastodonClient(baseURL: baseURL, accessToken: accessToken)
         isMastodonSignedIn = true
+        // Populate identity in the background for self detection
+        Task { await populateMastodonIdentityIfNeeded() }
     }
 
     /// Attempts to refresh the Bluesky session using the saved refresh JWT.
@@ -197,6 +200,24 @@ final class SessionStore {
             blueskyClient = updated
             signedInHandleBluesky = decoded.handle
         } catch { /* ignore */ }
+    }
+
+    private func populateMastodonIdentityIfNeeded() async {
+        guard let client = mastodonClient, signedInHandleMastodon == nil else { return }
+        var url = client.baseURL; url.append(path: "/api/v1/accounts/verify_credentials")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(client.accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        struct MeResp: Decodable { let acct: String }
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return }
+            let me = try JSONDecoder().decode(MeResp.self, from: data)
+            signedInHandleMastodon = me.acct
+        } catch {
+            // ignore errors; handle remains nil
+        }
     }
 
     // MARK: - Sign out

@@ -136,7 +136,7 @@ struct BlueskyClient: SocialClient {
         do { prof = try JSONDecoder().decode(BskyProfile.self, from: data) }
         catch let e as DecodingError { throw APIError.decoding(e) }
         let bio = prof.description.flatMap { AttributedString($0) }
-        return UnifiedUser(
+        var u = UnifiedUser(
             id: "bsky:\(prof.did)",
             network: .bluesky,
             handle: prof.handle,
@@ -147,6 +147,20 @@ struct BlueskyClient: SocialClient {
             followingCount: prof.followsCount,
             postsCount: prof.postsCount
         )
+        if let viewer = prof.viewer {
+            if let followingUri = viewer.following {
+                u.isFollowing = true
+                u.bskyFollowRkey = Self.extractRkey(fromAtUri: followingUri)
+            } else {
+                u.isFollowing = false
+                u.bskyFollowRkey = nil
+            }
+        } else {
+            // Viewer info absent → unknown follow state
+            u.isFollowing = nil
+            u.bskyFollowRkey = nil
+        }
+        return u
     }
 
     // MARK: - Author feed
@@ -291,6 +305,59 @@ struct BlueskyClient: SocialClient {
         }
     }
     func reply(to post: UnifiedPost, text: String) async throws { /* TODO: app.bsky.feed.post */ }
+
+    // MARK: - Follow / Unfollow
+    /// Follows the given Bluesky DID. Returns the created follow record rkey for future unfollow.
+    func followUser(did targetDid: String) async throws -> String? {
+        guard !targetDid.isEmpty else { return nil }
+        guard let repoDid = did else { throw APIError.unknown(URLError(.userAuthenticationRequired)) }
+        var url = pdsURL; url.append(path: "/xrpc/com.atproto.repo.createRecord")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        struct Record: Encodable {
+            let type = "app.bsky.graph.follow"
+            let subject: String
+            let createdAt: String
+            enum CodingKeys: String, CodingKey { case subject, createdAt; case type = "$type" }
+        }
+        struct Body: Encodable { let repo: String; let collection: String; let record: Record }
+
+        let createdAt = ISO8601DateFormatter().string(from: Date())
+        let body = Body(repo: repoDid, collection: "app.bsky.graph.follow", record: Record(subject: targetDid, createdAt: createdAt))
+        req.httpBody = try JSONEncoder().encode(body)
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let bodyStr = String(data: data, encoding: .utf8)
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1, body: bodyStr)
+        }
+        struct CreateResp: Decodable { let uri: String }
+        if let decoded = try? JSONDecoder().decode(CreateResp.self, from: data) {
+            return Self.extractRkey(fromAtUri: decoded.uri)
+        }
+        return nil
+    }
+
+    /// Unfollows using the follow record rkey.
+    func unfollowUser(rkey: String) async throws {
+        guard let repoDid = did else { throw APIError.unknown(URLError(.userAuthenticationRequired)) }
+        var url = pdsURL; url.append(path: "/xrpc/com.atproto.repo.deleteRecord")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let repo: String; let collection: String; let rkey: String }
+        let body = Body(repo: repoDid, collection: "app.bsky.graph.follow", rkey: rkey)
+        req.httpBody = try JSONEncoder().encode(body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let bodyStr = String(data: data, encoding: .utf8)
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1, body: bodyStr)
+        }
+    }
 
     // MARK: - Request helper
     private func performGET(_ url: URL) async throws -> Data {
@@ -744,6 +811,8 @@ struct BlueskyClient: SocialClient {
         let followersCount: Int?
         let followsCount: Int?
         let postsCount: Int?
+        let viewer: ProfileViewer?
+        struct ProfileViewer: Decodable { let following: String? }
     }
 
     private struct AuthorFeedResponse: Decodable {

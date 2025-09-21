@@ -233,7 +233,7 @@ struct MastodonClient: SocialClient {
     func fetchUserProfile(handle: String) async throws -> UnifiedUser {
         let acct = try await lookupAccount(handle: handle)
         let bio = htmlToAttributed(acct.note ?? "")
-        return UnifiedUser(
+        var user = UnifiedUser(
             id: "mastodon:\(acct.id)",
             network: .mastodon(instance: baseURL.host ?? baseURL.absoluteString),
             handle: acct.acct,
@@ -244,6 +244,13 @@ struct MastodonClient: SocialClient {
             followingCount: acct.following_count,
             postsCount: acct.statuses_count
         )
+        // If authenticated, fetch relationship to determine follow state
+        if !accessToken.isEmpty {
+            if let rel = try? await relationship(id: acct.id) {
+                user.isFollowing = rel.following
+            }
+        }
+        return user
     }
 
     // MARK: - Author feed
@@ -498,6 +505,48 @@ struct MastodonClient: SocialClient {
         let followers_count: Int?
         let following_count: Int?
         let statuses_count: Int?
+    }
+
+    private struct Relationship: Decodable { let id: String; let following: Bool? }
+
+    private func relationship(id: String) async throws -> Relationship? {
+        var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/api/v1/accounts/relationships"
+        comps?.queryItems = [URLQueryItem(name: "id[]", value: id)]
+        guard let url = comps?.url else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+        let arr = try JSONDecoder().decode([Relationship].self, from: data)
+        return arr.first
+    }
+
+    // MARK: - Follow / Unfollow
+    func followUser(id: String) async throws {
+        var url = baseURL; url.append(path: "/api/v1/accounts/\(id)/follow")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+    }
+
+    func unfollowUser(id: String) async throws {
+        var url = baseURL; url.append(path: "/api/v1/accounts/\(id)/unfollow")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
     }
 
     private struct MastoReblog: Decodable {
