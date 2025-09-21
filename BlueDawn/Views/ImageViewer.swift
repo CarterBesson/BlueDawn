@@ -16,7 +16,6 @@ struct ImageViewer: View {
     @State private var dragY: CGFloat = 0
     @State private var isZoomed: Bool = false
     @State private var showAltText: Bool = false
-    @State private var showActions: Bool = false
     @State private var isDownloading: Bool = false
     @State private var showAlert: Bool = false
     @State private var alertTitle: String = ""
@@ -96,9 +95,30 @@ struct ImageViewer: View {
                             }
                         }
 
-                        controlButton("ellipsis", label: "More options") {
-                            showActions = true
+                        Menu {
+                            Button {
+                                Task { await downloadCurrentImage() }
+                            } label: {
+                                Label("Download Image", systemImage: "arrow.down.circle")
+                            }
+                            Button {
+                                Haptics.notify(.warning)
+                                alertTitle = "Not Implemented"
+                                alertMessage = "Sharing will be added soon."
+                                showAlert = true
+                            } label: {
+                                Label("Share Image", systemImage: "square.and.arrow.up")
+                            }
+                            .disabled(true)
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: UI.iconSize, weight: .semibold))
+                                .frame(width: UI.controlSize, height: UI.controlSize)
+                                .foregroundStyle(.white)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .shadow(radius: 1.5)
                         }
+                        .accessibilityLabel("More options")
 
                         if isDownloading {
                             ProgressView()
@@ -133,18 +153,6 @@ struct ImageViewer: View {
                 }
                 .ignoresSafeArea()
             }
-        }
-        .confirmationDialog("Image Options", isPresented: $showActions, titleVisibility: .visible) {
-            Button("Download Image") { Task { await downloadCurrentImage() } }
-            Button("Share Image") {
-                // Stub: not implemented yet
-                Haptics.notify(.warning)
-                alertTitle = "Not Implemented"
-                alertMessage = "Sharing will be added soon."
-                showAlert = true
-            }
-            .disabled(true)
-            Button("Cancel", role: .cancel) { }
         }
         .alert(alertTitle, isPresented: $showAlert) {
             Button("OK", role: .cancel) { }
