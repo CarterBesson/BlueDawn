@@ -32,6 +32,9 @@ struct ProfileView: View {
                         profileTarget = ProfileTarget(network: network, handle: handle)
                         pushProfile = true
                     },
+                    onOpenPost: { opened in
+                        postSelection = opened
+                    },
                     onTapImage: { tappedPost, idx in
                         imageViewer = ImageViewerState(post: tappedPost, index: idx)
                     }
@@ -61,10 +64,24 @@ struct ProfileView: View {
             }
             if let scheme = url.scheme, (scheme == "http" || scheme == "https"), let host = url.host {
                 let path = url.path
+                if let statusID = extractMastoStatusID(fromPath: path) {
+                    Task { await openMastodonStatus(host: host, id: statusID, url: url) }
+                    return .handled
+                }
                 if path.hasPrefix("/@") {
                     let username = String(path.dropFirst(2))
-                    let handle = "\(username)@\(host)"
-                    profileTarget = ProfileTarget(network: .mastodon(instance: host), handle: handle); pushProfile = true
+                    profileTarget = ProfileTarget(network: .mastodon(instance: host), handle: username); pushProfile = true
+                    return .handled
+                }
+                if path.hasPrefix("/users/") {
+                    let comps = path.split(separator: "/").map(String.init)
+                    if comps.count >= 2 {
+                        profileTarget = ProfileTarget(network: .mastodon(instance: host), handle: comps[1]); pushProfile = true
+                        return .handled
+                    }
+                }
+                if let statusID = extractMastoStatusID(fromPath: path) {
+                    Task { await openMastodonStatus(host: host, id: statusID, url: url) }
                     return .handled
                 }
                 if host == "bsky.app" && path.hasPrefix("/profile/") {
@@ -111,6 +128,34 @@ struct ProfileView: View {
         #endif
     }
 
+    private func extractMastoStatusID(fromPath path: String) -> String? {
+        let comps = path.split(separator: "/").map(String.init)
+        if comps.count >= 2, comps[0].hasPrefix("@") {
+            let last = comps.last!
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: last)) { return last }
+        }
+        if let idx = comps.firstIndex(of: "statuses"), idx + 1 < comps.count {
+            let cand = comps[idx + 1]
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: cand)) { return cand }
+        }
+        return nil
+    }
+
+    @MainActor
+    private func openMastodonStatus(host: String, id: String, url: URL) async {
+        let client: MastodonClient
+        if let c = session.mastodonClient, c.baseURL.host == host { client = c }
+        else if let base = URL(string: "https://\(host)") { client = MastodonClient(baseURL: base, accessToken: "") }
+        else { return }
+        if let post = try? await client.fetchStatus(id: id) {
+            postSelection = post
+            return
+        }
+        // Fallback to SafariView if enabled
+        #if canImport(SafariServices) && canImport(UIKit)
+        if session.openLinksInApp { safariURL = url }
+        #endif
+    }
     @ViewBuilder
     private func header(user u: UnifiedUser) -> some View {
         VStack(alignment: .leading, spacing: 12) {

@@ -22,6 +22,7 @@ struct ThreadPreviewView: View {
                     post: rootPost,
                     showAvatar: false,
                     onOpenProfile: onOpenProfile,
+                    onOpenPost: onOpenPost,
                     onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) },
                     onOpenExternalURL: onOpenExternalURL
                 )
@@ -73,6 +74,7 @@ struct ThreadPreviewView: View {
                             post: reply,
                             showAvatar: false,
                             onOpenProfile: onOpenProfile,
+                            onOpenPost: onOpenPost,
                             onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) },
                             onOpenExternalURL: onOpenExternalURL
                         )

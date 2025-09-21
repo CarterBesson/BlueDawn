@@ -33,6 +33,7 @@ struct TimelineRow: View {
                         post: post,
                         showAvatar: false,
                         onOpenProfile: onOpenProfile,
+                        onOpenPost: onOpenPost,
                         onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) },
                         onOpenExternalURL: onOpenExternalURL
                     )

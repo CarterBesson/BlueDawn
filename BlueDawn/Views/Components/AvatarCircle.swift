@@ -3,6 +3,7 @@ import SwiftUI
 struct AvatarCircle: View {
     let handle: String
     let url: URL?
+    var size: CGFloat = 44
 
     var body: some View {
         Group {
@@ -19,12 +20,12 @@ struct AvatarCircle: View {
                 Circle().fill(Color.secondary.opacity(0.2))
                     .overlay(
                         Text(String(handle.prefix(1).uppercased()))
-                            .font(.system(size: 22, weight: .semibold))
+                            .font(.system(size: max(10, size * 0.5), weight: .semibold))
                             .foregroundStyle(.secondary)
                     )
             }
         }
-        .frame(width: 44, height: 44)
+        .frame(width: size, height: size)
         .clipShape(Circle())
     }
 }

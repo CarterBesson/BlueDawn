@@ -53,9 +53,13 @@ final class ProfileViewModel {
         case .bluesky:
             precondition(session.blueskyClient != nil, "Not signed into Bluesky")
             return session.blueskyClient!
-        case .mastodon:
-            precondition(session.mastodonClient != nil, "Not signed into Mastodon")
-            return session.mastodonClient!
+        case .mastodon(let instance):
+            if let c = session.mastodonClient, c.baseURL.host == instance {
+                return c
+            }
+            // Fallback public client for cross-instance profiles (no auth)
+            let url = URL(string: "https://\(instance)")!
+            return MastodonClient(baseURL: url, accessToken: "")
         }
     }
 }

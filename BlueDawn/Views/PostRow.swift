@@ -5,6 +5,8 @@ struct PostRow: View {
     let post: UnifiedPost
     var showAvatar: Bool = true
     var onOpenProfile: ((Network, String) -> Void)? = nil
+    // Open a post (used for quoted/embedded posts)
+    var onOpenPost: ((UnifiedPost) -> Void)? = nil
     // New: notify parent when an image is tapped (post + index within post.media)
     var onTapImage: ((UnifiedPost, Int) -> Void)? = nil
     // Notify parent when an external web URL should be opened (non-profile links)
@@ -80,6 +82,9 @@ struct PostRow: View {
             crossPostBadge
             header
             content
+            if let quoted = post.quotedPost {
+                QuotedPostCard(post: quoted, onOpenPost: { q in onOpenPost?(q) }, onOpenProfile: onOpenProfile)
+            }
             if !post.media.isEmpty { mediaStrip }
             actionBar
         }
@@ -372,14 +377,27 @@ private extension PostRow {
             }
         }
 
-        // Mastodon profile links like https://instance/@user
+        // Mastodon links (status first, then profile)
         if let scheme = url.scheme, (scheme == "https" || scheme == "http"),
            let host = url.host {
             let path = url.path
+            // Mastodon status links: https://host/@user/<id> or /users/<acct>/statuses/<id>
+            if let statusID = extractMastoStatusID(fromPath: path) {
+                Task { await openMastodonStatus(host: host, id: statusID, originalURL: url) }
+                return .handled
+            }
+            // Mastodon profile links like https://instance/@user
             if path.hasPrefix("/@") {
                 let username = String(path.dropFirst(2)) // drop "/@"
-                let handle = username.isEmpty ? "" : "\(username)@\(host)"
-                if !handle.isEmpty { onOpenProfile?(.mastodon(instance: host), handle); return .handled }
+                if !username.isEmpty { onOpenProfile?(.mastodon(instance: host), username); return .handled }
+            }
+            // Mastodon profile style: /users/<acct>
+            if path.hasPrefix("/users/") {
+                let comps = path.split(separator: "/").map(String.init)
+                if comps.count >= 2 {
+                    let acct = comps[1]
+                    if !acct.isEmpty { onOpenProfile?(.mastodon(instance: host), acct); return .handled }
+                }
             }
             // Bluesky web profile links: https://bsky.app/profile/<handle>
             if host == "bsky.app" && path.hasPrefix("/profile/") {
@@ -399,5 +417,44 @@ private extension PostRow {
         }
 
         return .systemAction
+    }
+
+    func extractMastoStatusID(fromPath path: String) -> String? {
+        let comps = path.split(separator: "/").map(String.init)
+        if comps.count >= 2, comps[0].hasPrefix("@") {
+            let last = comps.last!
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: last)) { return last }
+        }
+        if let idx = comps.firstIndex(of: "statuses"), idx + 1 < comps.count {
+            let cand = comps[idx + 1]
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: cand)) { return cand }
+        }
+        return nil
+    }
+
+    @MainActor
+    func openMastodonStatus(host: String, id: String, originalURL: URL?) async {
+        // Choose client: use signed-in client if same host; otherwise public client
+        let client: MastodonClient
+        if let c = session.mastodonClient, c.baseURL.host == host {
+            client = c
+        } else {
+            guard let base = URL(string: "https://\(host)") else { return }
+            client = MastodonClient(baseURL: base, accessToken: "")
+        }
+        do {
+            if let post = try await client.fetchStatus(id: id) {
+                onOpenPost?(post)
+                return
+            }
+        } catch {
+            // ignore
+        }
+        // Fallback: open in-browser if configured
+        if let u = originalURL {
+            if session.openLinksInApp {
+                onOpenExternalURL?(u)
+            }
+        }
     }
 }
