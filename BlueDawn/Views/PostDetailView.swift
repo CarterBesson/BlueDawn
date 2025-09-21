@@ -9,6 +9,7 @@ struct PostDetailView: View {
     @State private var imageViewer: ImageViewerState? = nil
     @State private var profileRoute: ProfileRoute? = nil
     @State private var safariURL: URL? = nil
+    @State private var postSelection: UnifiedPost? = nil
 
     private struct ProfileRoute: Identifiable, Hashable {
         let id = UUID()
@@ -84,6 +85,13 @@ struct PostDetailView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     header
                     content
+                    if let quoted = post.quotedPost {
+                        QuotedPostCard(post: quoted, onOpenPost: { q in
+                            postSelection = q
+                        }, onOpenProfile: { net, handle in
+                            profileRoute = ProfileRoute(network: net, handle: handle)
+                        })
+                    }
                     if !post.media.isEmpty { mediaGrid }
                     actionBar
                 }
@@ -145,6 +153,9 @@ struct PostDetailView: View {
             }
             .navigationDestination(item: $profileRoute) { route in
                 ProfileView(network: route.network, handle: route.handle, session: session)
+            }
+            .navigationDestination(item: $postSelection) { p in
+                PostDetailView(post: p, viewModel: ThreadViewModel(session: session, root: p))
             }
     }
 
@@ -286,7 +297,12 @@ struct PostDetailView: View {
                     NavigationLink {
                         PostDetailView(post: item.post, viewModel: ThreadViewModel(session: session, root: item.post))
                     } label: {
-                        PostRow(post: item.post, showAvatar: false)
+                        PostRow(post: item.post, showAvatar: false, onOpenProfile: { net, handle in
+                            profileRoute = ProfileRoute(network: net, handle: handle)
+                        }, onOpenPost: { q in
+                            // Push to the quoted post
+                            // Note: nested interactions inside NavigationLink may vary by OS
+                        })
                     }
                     .buttonStyle(.plain)
 

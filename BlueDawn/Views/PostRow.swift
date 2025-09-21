@@ -5,6 +5,8 @@ struct PostRow: View {
     let post: UnifiedPost
     var showAvatar: Bool = true
     var onOpenProfile: ((Network, String) -> Void)? = nil
+    // Open a post (used for quoted/embedded posts)
+    var onOpenPost: ((UnifiedPost) -> Void)? = nil
     // New: notify parent when an image is tapped (post + index within post.media)
     var onTapImage: ((UnifiedPost, Int) -> Void)? = nil
     // Notify parent when an external web URL should be opened (non-profile links)
@@ -80,6 +82,9 @@ struct PostRow: View {
             crossPostBadge
             header
             content
+            if let quoted = post.quotedPost {
+                QuotedPostCard(post: quoted, onOpenPost: { q in onOpenPost?(q) }, onOpenProfile: onOpenProfile)
+            }
             if !post.media.isEmpty { mediaStrip }
             actionBar
         }

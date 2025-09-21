@@ -32,6 +32,9 @@ struct ProfileView: View {
                         profileTarget = ProfileTarget(network: network, handle: handle)
                         pushProfile = true
                     },
+                    onOpenPost: { opened in
+                        postSelection = opened
+                    },
                     onTapImage: { tappedPost, idx in
                         imageViewer = ImageViewerState(post: tappedPost, index: idx)
                     }

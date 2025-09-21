@@ -398,18 +398,29 @@ struct BlueskyClient: SocialClient {
     private func mapPostToUnified(_ p: Post, isRepost: Bool = false, boostedByHandle: String? = nil, boostedByDisplayName: String? = nil) -> UnifiedPost {
         let created = parseISO8601(p.record?.createdAt ?? p.indexedAt ?? "") ?? Date()
         let text = attributedFromBsky(text: p.record?.text ?? "", facets: p.record?.facets)
-        let media: [Media] = {
-            guard let embed = p.embed else { return [] }
+        var media: [Media] = []
+        var quoted: QuotedPost? = nil
+        if let embed = p.embed {
             switch embed {
             case .images(let view):
-                return view.images.compactMap { img in
+                media = view.images.compactMap { img in
                     guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
                     return Media(url: url, altText: img.alt, kind: .image)
                 }
-            default:
-                return []
+            case .record(let rv):
+                if case .view(let r) = rv.record { quoted = mapEmbeddedRecordToQuoted(r) }
+            case .recordWithMedia(let rwm):
+                if case .view(let r) = rwm.record { quoted = mapEmbeddedRecordToQuoted(r) }
+                if let m = rwm.media, case .images(let view) = m {
+                    media = view.images.compactMap { img in
+                        guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
+                        return Media(url: url, altText: img.alt, kind: .image)
+                    }
+                }
+            case .unsupported:
+                break
             }
-        }()
+        }
         let counts = PostCounts(
             replies: p.replyCount,
             boostsReposts: p.repostCount,
@@ -444,7 +455,8 @@ struct BlueskyClient: SocialClient {
             isReposted: isReposted,
             isBookmarked: false,
             boostedByHandle: boostedByHandle,
-            boostedByDisplayName: boostedByDisplayName
+            boostedByDisplayName: boostedByDisplayName,
+            quotedPost: quoted
         )
     }
 
@@ -626,6 +638,8 @@ struct BlueskyClient: SocialClient {
 
     private enum Embed: Decodable {
         case images(ImagesView)
+        case record(RecordView)
+        indirect case recordWithMedia(RecordWithMediaView)
         case unsupported
 
         init(from decoder: Decoder) throws {
@@ -634,10 +648,74 @@ struct BlueskyClient: SocialClient {
             switch type {
             case "app.bsky.embed.images#view":
                 self = .images(try ImagesView(from: decoder))
+            case "app.bsky.embed.record#view":
+                self = .record(try RecordView(from: decoder))
+            case "app.bsky.embed.recordWithMedia#view":
+                self = .recordWithMedia(try RecordWithMediaView(from: decoder))
             default:
                 self = .unsupported
             }
         }
+    }
+
+    private struct RecordView: Decodable {
+        let record: EmbeddedRecord
+        enum CodingKeys: String, CodingKey { case record }
+    }
+
+    private struct RecordWithMediaView: Decodable {
+        let record: EmbeddedRecord
+        let media: Embed?
+        enum CodingKeys: String, CodingKey { case record, media }
+    }
+
+    private enum EmbeddedRecord: Decodable {
+        case view(ViewRecord)
+        case blocked
+        case notFound
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: DynamicCodingKeys.self)
+            let type = try c.decodeIfPresent(String.self, forKey: DynamicCodingKeys(stringValue: "$type")!) ?? ""
+            switch type {
+            case "app.bsky.embed.record#viewRecord":
+                self = .view(try ViewRecord(from: decoder))
+            case "app.bsky.embed.record#viewBlocked":
+                self = .blocked
+            case "app.bsky.embed.record#viewNotFound":
+                self = .notFound
+            default:
+                self = .notFound
+            }
+        }
+    }
+
+    private struct ViewRecord: Decodable {
+        let uri: String
+        let cid: String
+        let author: Author
+        let value: RecordValue?
+    }
+
+    private struct RecordValue: Decodable {
+        let text: String?
+        let createdAt: String?
+        let facets: [Facet]?
+    }
+
+    private func mapEmbeddedRecordToQuoted(_ r: ViewRecord) -> QuotedPost {
+        let created = parseISO8601(r.value?.createdAt ?? "") ?? Date()
+        let text = attributedFromBsky(text: r.value?.text ?? "", facets: r.value?.facets)
+        return QuotedPost(
+            id: "bsky:\(r.uri)",
+            network: .bluesky,
+            authorHandle: r.author.handle,
+            authorDisplayName: r.author.displayName,
+            authorAvatarURL: URL(string: r.author.avatar ?? ""),
+            createdAt: created,
+            text: text,
+            media: []
+        )
     }
 
     private struct ImagesView: Decodable {
