@@ -9,6 +9,7 @@ struct ProfileView: View {
     @State private var postSelection: UnifiedPost? = nil
     @State private var imageViewer: ImageViewerState? = nil
     @State private var isFollowing: Bool = false
+    @State private var safariURL: URL? = nil
     private struct ProfileTarget: Identifiable { let id = UUID(); let network: Network; let handle: String }
 
     init(network: Network, handle: String, session: SessionStore) {
@@ -71,6 +72,15 @@ struct ProfileView: View {
                     profileTarget = ProfileTarget(network: .bluesky, handle: handle); pushProfile = true
                     return .handled
                 }
+                // Non-profile web links
+                if session.openLinksInApp {
+                    #if canImport(SafariServices) && canImport(UIKit)
+                    safariURL = url
+                    return .handled
+                    #else
+                    return .systemAction
+                    #endif
+                }
             }
             return .systemAction
         })
@@ -94,6 +104,11 @@ struct ProfileView: View {
         .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
             ImageViewer(post: selection.post, startIndex: selection.index)
         }
+        #if canImport(SafariServices)
+        .sheet(isPresented: Binding(get: { safariURL != nil }, set: { if !$0 { safariURL = nil } })) {
+            if let url = safariURL { SafariView(url: url) }
+        }
+        #endif
     }
 
     @ViewBuilder
