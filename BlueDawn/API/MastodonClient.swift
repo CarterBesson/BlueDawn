@@ -18,7 +18,7 @@ struct MastodonClient: SocialClient {
 
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -100,7 +100,7 @@ struct MastodonClient: SocialClient {
 
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -133,6 +133,21 @@ struct MastodonClient: SocialClient {
         }
     }
 
+    // MARK: - Single status fetch (public)
+    /// Fetch a single status by id from this client's baseURL and map to UnifiedPost.
+    func fetchStatus(id: String) async throws -> UnifiedPost? {
+        var url = baseURL
+        url.append(path: "/api/v1/statuses/\(id)")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+        guard let s = try? JSONDecoder().decode(MastoStatus.self, from: data) else { return nil }
+        return mapStatusToUnified(s)
+    }
+
     // MARK: Thread ancestors (parents)
     func fetchAncestors(root post: UnifiedPost) async throws -> [UnifiedPost] {
         guard let id = post.id.split(separator: ":").last.map(String.init) else { return [] }
@@ -141,7 +156,7 @@ struct MastodonClient: SocialClient {
 
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -160,7 +175,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/favourite")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -175,7 +190,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/reblog")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -190,7 +205,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/unfavourite")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -204,7 +219,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/unreblog")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -272,7 +287,16 @@ struct MastodonClient: SocialClient {
     private func lookupAccount(handle: String) async throws -> Account {
         guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw URLError(.badURL) }
         comps.path = "/api/v1/accounts/lookup"
-        comps.queryItems = [ URLQueryItem(name: "acct", value: handle) ]
+        // If handle includes @domain matching this instance, strip it for reliability
+        let acct: String = {
+            if let at = handle.firstIndex(of: "@") {
+                let name = String(handle[..<at])
+                let domain = String(handle[handle.index(after: at)...])
+                if domain == (baseURL.host ?? domain) { return name }
+            }
+            return handle
+        }()
+        comps.queryItems = [ URLQueryItem(name: "acct", value: acct) ]
         guard let url = comps.url else { throw URLError(.badURL) }
 
         var req = URLRequest(url: url)
@@ -280,12 +304,28 @@ struct MastodonClient: SocialClient {
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+            }
+            return try JSONDecoder().decode(Account.self, from: data)
+        } catch {
+            // Fallback: try with full acct including domain if initial stripped form failed
+            if acct == handle { throw error }
+            var comps2 = comps
+            comps2.queryItems = [ URLQueryItem(name: "acct", value: handle) ]
+            guard let url2 = comps2.url else { throw URLError(.badURL) }
+            var req2 = URLRequest(url: url2)
+            req2.httpMethod = "GET"
+            if !accessToken.isEmpty { req2.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+            req2.setValue("application/json", forHTTPHeaderField: "Accept")
+            let (data2, resp2) = try await URLSession.shared.data(for: req2)
+            guard let http2 = resp2 as? HTTPURLResponse, (200..<300).contains(http2.statusCode) else {
+                throw APIError.badStatus((resp2 as? HTTPURLResponse)?.statusCode ?? -1)
+            }
+            return try JSONDecoder().decode(Account.self, from: data2)
         }
-
-        return try JSONDecoder().decode(Account.self, from: data)
     }
 
     // MARK: - Mapping helpers

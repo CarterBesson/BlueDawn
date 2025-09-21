@@ -117,11 +117,22 @@ struct PostDetailView: View {
                 }
                 if let scheme = url.scheme, (scheme == "https" || scheme == "http"), let host = url.host {
                     let path = url.path
+                    // Status first, then profile
+                    if let statusID = extractMastoStatusID(fromPath: path) {
+                        Task { await openMastodonStatus(host: host, id: statusID, originalURL: url) }
+                        return .handled
+                    }
                     if path.hasPrefix("/@") {
                         let username = String(path.dropFirst(2))
-                        let handle = "\(username)@\(host)"
-                        profileRoute = ProfileRoute(network: .mastodon(instance: host), handle: handle)
+                        profileRoute = ProfileRoute(network: .mastodon(instance: host), handle: username)
                         return .handled
+                    }
+                    if path.hasPrefix("/users/") {
+                        let comps = path.split(separator: "/").map(String.init)
+                        if comps.count >= 2 {
+                            profileRoute = ProfileRoute(network: .mastodon(instance: host), handle: comps[1])
+                            return .handled
+                        }
                     }
                     if host == "bsky.app" && path.hasPrefix("/profile/") {
                         let handle = String(path.dropFirst("/profile/".count))
@@ -300,8 +311,7 @@ struct PostDetailView: View {
                         PostRow(post: item.post, showAvatar: false, onOpenProfile: { net, handle in
                             profileRoute = ProfileRoute(network: net, handle: handle)
                         }, onOpenPost: { q in
-                            // Push to the quoted post
-                            // Note: nested interactions inside NavigationLink may vary by OS
+                            postSelection = q
                         })
                     }
                     .buttonStyle(.plain)
@@ -474,5 +484,34 @@ struct PostDetailView: View {
         df.dateStyle = .medium
         df.timeStyle = .short
         return df.string(from: date)
+    }
+
+    private func extractMastoStatusID(fromPath path: String) -> String? {
+        let comps = path.split(separator: "/").map(String.init)
+        if comps.count >= 2, comps[0].hasPrefix("@") {
+            let last = comps.last!
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: last)) { return last }
+        }
+        if let idx = comps.firstIndex(of: "statuses"), idx + 1 < comps.count {
+            let cand = comps[idx + 1]
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: cand)) { return cand }
+        }
+        return nil
+    }
+
+    @MainActor
+    private func openMastodonStatus(host: String, id: String, originalURL: URL?) async {
+        let client: MastodonClient
+        if let c = session.mastodonClient, c.baseURL.host == host { client = c }
+        else if let base = URL(string: "https://\(host)") { client = MastodonClient(baseURL: base, accessToken: "") }
+        else { return }
+        if let post = try? await client.fetchStatus(id: id) {
+            postSelection = post
+            return
+        }
+        // Fallback
+        #if canImport(SafariServices) && canImport(UIKit)
+        if session.openLinksInApp { safariURL = originalURL }
+        #endif
     }
 }
