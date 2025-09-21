@@ -10,4 +10,8 @@ struct UnifiedUser: Identifiable {
     let followersCount: Int?
     let followingCount: Int?
     let postsCount: Int?
+    // Following state (if known)
+    var isFollowing: Bool? = nil
+    // Bluesky-specific: follow record rkey for unfollow
+    var bskyFollowRkey: String? = nil
 }
