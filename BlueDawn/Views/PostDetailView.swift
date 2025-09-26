@@ -77,6 +77,18 @@ struct PostDetailView: View {
                                 Spacer(minLength: 0)
                             }
                             .padding(.vertical, 10)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                let long = session.swipeTrailingLong
+                                let short = session.swipeTrailingShort
+                                swipeButton(for: long, post: anc)
+                                swipeButton(for: short, post: anc)
+                            }
+                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                                let long = session.swipeLeadingLong
+                                let short = session.swipeLeadingShort
+                                swipeButton(for: long, post: anc)
+                                swipeButton(for: short, post: anc)
+                            }
                             Divider()
                         }
                     }
@@ -339,7 +351,18 @@ struct PostDetailView: View {
                 }
                 .padding(.leading, CGFloat(item.depth) * 16)
                 .padding(.vertical, 4)
-
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    let long = session.swipeTrailingLong
+                    let short = session.swipeTrailingShort
+                    swipeButton(for: long, post: item.post)
+                    swipeButton(for: short, post: item.post)
+                }
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    let long = session.swipeLeadingLong
+                    let short = session.swipeLeadingShort
+                    swipeButton(for: long, post: item.post)
+                    swipeButton(for: short, post: item.post)
+                }
                 Divider().padding(.leading, CGFloat(item.depth) * 16)
             }
 
@@ -574,5 +597,146 @@ struct PostDetailView: View {
         #if canImport(SafariServices) && canImport(UIKit)
         if session.openLinksInApp { safariURL = originalURL }
         #endif
+    }
+}
+
+// MARK: - Swipe actions for ancestor/reply rows
+private extension PostDetailView {
+    @ViewBuilder
+    func swipeButton(for action: SessionStore.SwipeAction, post p: UnifiedPost) -> some View {
+        switch action {
+        case .none:
+            EmptyView()
+        case .reply:
+            Button {
+                Haptics.impact(.light)
+                postSelection = p
+            } label: { Label(action.label, systemImage: action.systemImage) }
+            .tint(.blue)
+        case .like:
+            Button { Task { await toggleLike(for: p) } } label: { Label(labelForLike(p), systemImage: symbolForLike(p)) }
+            .tint(.pink)
+        case .repost:
+            Button { Task { await toggleRepost(for: p) } } label: { Label(labelForRepost(p), systemImage: "arrow.2.squarepath") }
+            .tint(.green)
+        case .bookmark:
+            if case .mastodon = p.network {
+                Button { Task { await toggleBookmark(for: p) } } label: { Label(labelForBookmark(p), systemImage: symbolForBookmark(p)) }
+                .tint(.yellow)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    private func labelForLike(_ p: UnifiedPost) -> String { session.state(for: p).isLiked ? "Unlike" : "Like" }
+    private func symbolForLike(_ p: UnifiedPost) -> String { session.state(for: p).isLiked ? "heart.fill" : "heart" }
+    private func labelForRepost(_ p: UnifiedPost) -> String { session.state(for: p).isReposted ? "Undo Repost" : "Repost" }
+    private func labelForBookmark(_ p: UnifiedPost) -> String { session.state(for: p).isBookmarked ? "Remove" : "Bookmark" }
+    private func symbolForBookmark(_ p: UnifiedPost) -> String { session.state(for: p).isBookmarked ? "bookmark.fill" : "bookmark" }
+
+    @MainActor
+    func toggleLike(for p: UnifiedPost) async {
+        let s = session.state(for: p)
+        let prevLiked = s.isLiked
+        let prevCount = s.likeCount
+        let prevRkey = s.bskyLikeRkey
+        if s.isLiked {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: p.id) { $0.isLiked = false; $0.likeCount = max(0, prevCount - 1) } }
+            switch p.network {
+            case .bluesky:
+                do { try await session.blueskyClient?.unlike(post: p, rkey: prevRkey) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+                }
+            case .mastodon:
+                do { try await session.mastodonClient?.unlike(post: p, rkey: nil) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+                }
+            }
+            return
+        }
+        Haptics.impact(.light)
+        withAnimation { session.updateState(for: p.id) { $0.isLiked = true; $0.likeCount = prevCount + 1 } }
+        switch p.network {
+        case .bluesky:
+            do {
+                let rkey = try await session.blueskyClient?.like(post: p)
+                withAnimation { session.updateState(for: p.id) { $0.bskyLikeRkey = rkey ?? prevRkey } }
+            } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+            }
+        case .mastodon:
+            do { _ = try await session.mastodonClient?.like(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+            }
+        }
+    }
+
+    @MainActor
+    func toggleRepost(for p: UnifiedPost) async {
+        let s = session.state(for: p)
+        let prev = s.isReposted
+        let prevCount = s.repostCount
+        let prevRkey = s.bskyRepostRkey
+        if s.isReposted {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: p.id) { $0.isReposted = false; $0.repostCount = max(0, prevCount - 1) } }
+            switch p.network {
+            case .bluesky:
+                do { try await session.blueskyClient?.unrepost(post: p, rkey: prevRkey) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+                }
+            case .mastodon:
+                do { try await session.mastodonClient?.unrepost(post: p, rkey: nil) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+                }
+            }
+            return
+        }
+        Haptics.impact(.light)
+        withAnimation { session.updateState(for: p.id) { $0.isReposted = true; $0.repostCount = prevCount + 1 } }
+        switch p.network {
+        case .bluesky:
+            do {
+                let rkey = try await session.blueskyClient?.repost(post: p)
+                withAnimation { session.updateState(for: p.id) { $0.bskyRepostRkey = rkey ?? prevRkey } }
+            } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+            }
+        case .mastodon:
+            do { _ = try await session.mastodonClient?.repost(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+            }
+        }
+    }
+
+    @MainActor
+    func toggleBookmark(for p: UnifiedPost) async {
+        guard case .mastodon = p.network else { return }
+        let prev = session.state(for: p).isBookmarked
+        if prev {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: p.id) { $0.isBookmarked = false } }
+            do { try await session.mastodonClient?.unbookmark(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isBookmarked = prev } }
+            }
+        } else {
+            Haptics.impact(.light)
+            withAnimation { session.updateState(for: p.id) { $0.isBookmarked = true } }
+            do { try await session.mastodonClient?.bookmark(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isBookmarked = prev } }
+            }
+        }
     }
 }

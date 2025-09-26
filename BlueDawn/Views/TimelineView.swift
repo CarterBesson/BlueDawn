@@ -143,6 +143,13 @@ struct HomeTimelineView: View {
             // Mark restore complete after any jump animation settles
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { didInitialRestore = true }
         }
+        .onChange(of: viewModel.filter) { _, _ in
+            // When switching filters, jump to top of the new dataset
+            if let topID = viewModel.posts.first?.id {
+                anchorID = topID
+                pendingScrollToID = topID
+            }
+        }
     }
 }
 

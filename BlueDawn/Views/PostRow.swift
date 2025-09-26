@@ -90,7 +90,6 @@ struct PostRow: View {
                 QuotedPostCard(post: quoted, onOpenPost: { q in onOpenPost?(q) }, onOpenProfile: onOpenProfile)
             }
             if !post.media.isEmpty { mediaStrip }
-            actionBar
         }
         .padding(.vertical, compactPadding ? 0 : 10)
         .padding(.horizontal, compactPadding ? 0 : 12)
