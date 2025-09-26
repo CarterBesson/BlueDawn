@@ -146,6 +146,9 @@ struct PostRow: View {
         Text(post.text)
             .font(.body)
             .textSelection(.enabled)
+            // Ensure long text in timeline expands and never truncates oddly
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
     }
 
     // MARK: - Media
@@ -201,7 +204,7 @@ struct PostRow: View {
                     )
                 }
             }
-            .padding(.top, 4)
+            
         }
     }
 
@@ -242,7 +245,7 @@ struct PostRow: View {
         }
         .font(.subheadline)
         .foregroundStyle(.secondary)
-        .padding(.top, 2)
+        .padding(.top, 0)
         .buttonStyle(.plain)
     }
 

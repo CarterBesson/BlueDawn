@@ -66,6 +66,9 @@ struct PostDetailView: View {
                             },
                             onOpenPost: { p in
                                 postSelection = p
+                            },
+                            onTapImage: { tappedPost, idx in
+                                imageViewer = ImageViewerState(post: tappedPost, index: idx)
                             }
                         )
                         .contentShape(Rectangle())
@@ -324,6 +327,9 @@ struct PostDetailView: View {
                         },
                         onOpenPost: { q in
                             postSelection = q
+                        },
+                        onTapImage: { tappedPost, idx in
+                            imageViewer = ImageViewerState(post: tappedPost, index: idx)
                         }
                     )
                     .contentShape(Rectangle())
@@ -368,7 +374,7 @@ struct PostDetailView: View {
         }
         .font(.title3)
         .foregroundStyle(.secondary)
-        .padding(.top, 8)
+        .padding(.top, 0)
         .buttonStyle(.plain)
     }
 
