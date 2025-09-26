@@ -21,6 +21,7 @@ struct HomeTimelineView: View {
     @State private var postSelection: UnifiedPost? = nil
     @State private var safariURL: URL? = nil
     @State private var showMyProfiles: Bool = false
+    @State private var didInitialRestore: Bool = false
 
     private struct ProfileRoute: Identifiable, Hashable {
         let id = UUID()
@@ -28,6 +29,12 @@ struct HomeTimelineView: View {
         let handle: String
     }
     @State private var profileRoute: ProfileRoute? = nil
+
+    private var aboveCount: Int {
+        guard let anchorID,
+              let idx = viewModel.posts.firstIndex(where: { $0.id == anchorID }) else { return 0 }
+        return idx // number of items before the anchor
+    }
 
     var body: some View {
         TimelineList(
@@ -52,11 +59,13 @@ struct HomeTimelineView: View {
                 #endif
             },
             onRefresh: { await viewModel.refresh() },
-            onUpdateAnchor: { items in
-                // Choose first item in on-screen order whose id is visible
-                if let firstVisible = items.first(where: { visibleIDs.contains($0.id) }) {
-                    anchorID = firstVisible.id
-                }
+            onUpdateAnchor: { topVisibleID, items in
+                // Avoid updating the saved anchor while jumping or refreshing
+                if !didInitialRestore || jumpInProgress || viewModel.isLoading { return }
+                guard let topID = topVisibleID else { return }
+                if anchorID == topID { return }
+                anchorID = topID
+                viewModel.updateAnchorPostID(anchorID)
             }
         )
         .navigationTitle("Home")
@@ -73,6 +82,31 @@ struct HomeTimelineView: View {
         }
         .navigationDestination(item: $profileRoute) { route in
             ProfileView(network: route.network, handle: route.handle, session: session)
+        }
+        .overlay(alignment: .topTrailing) {
+            if aboveCount > 0 {
+                Button {
+                    if let topID = viewModel.posts.first?.id {
+                        pendingScrollToID = topID
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.up")
+                        Text("\(aboveCount)")
+                    }
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .overlay(
+                        Capsule().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 8)
+                .padding(.trailing, 12)
+            }
         }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -95,9 +129,31 @@ struct HomeTimelineView: View {
         .navigationDestination(isPresented: $showMyProfiles) {
             MyProfilesView()
         }
+        .task {
+            let restoredAnchor = await viewModel.loadPersisted()
+            if let anchor = restoredAnchor {
+                // Apply anchor immediately and schedule an explicit jump once rows exist
+                anchorID = anchor
+                DispatchQueue.main.async { pendingScrollToID = anchor }
+            }
+            // Fetch new items (if any) without disturbing position
+            await viewModel.refresh()
+            // Reassert anchor after refresh to avoid drift
+            if let anchor = restoredAnchor { anchorID = anchor }
+            // Mark restore complete after any jump animation settles
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { didInitialRestore = true }
+        }
     }
 }
 
+
+// Tracks each row's top Y position within the list's coordinate space
+private struct RowTopPreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGFloat] = [:]
+    static func reduce(value: inout [String : CGFloat], nextValue: () -> [String : CGFloat]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
 
 struct TimelineList: View {
     let posts: [UnifiedPost]
@@ -113,7 +169,7 @@ struct TimelineList: View {
     let onTapImage: (UnifiedPost, Int) -> Void
     let onOpenExternalURL: (URL) -> Void
     let onRefresh: () async -> Void
-    let onUpdateAnchor: ([UnifiedPost]) -> Void
+    let onUpdateAnchor: (_ topVisibleID: String?, _ items: [UnifiedPost]) -> Void
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -128,14 +184,18 @@ struct TimelineList: View {
                         onOpenExternalURL: onOpenExternalURL
                     )
                     .id(post.id)
+                    .background(
+                        GeometryReader { geo in
+                            // Report each row's top Y in the list's coordinate space
+                            Color.clear.preference(key: RowTopPreferenceKey.self, value: [post.id: geo.frame(in: .named("timelineList")).minY])
+                        }
+                    )
                     .onAppear {
                         if let idx = posts.firstIndex(where: { $0.id == post.id }) { onItemAppear(idx) }
                         visibleIDs.insert(post.id)
-                        onUpdateAnchor(posts)
                     }
                     .onDisappear {
                         visibleIDs.remove(post.id)
-                        onUpdateAnchor(posts)
                     }
                 }
 
@@ -151,6 +211,28 @@ struct TimelineList: View {
             .refreshable { await onRefresh() }
             .scrollPosition(id: $anchorID, anchor: .top)
             .transaction { if !jumpInProgress { $0.animation = nil } }
+            .coordinateSpace(name: "timelineList")
+            .onPreferenceChange(RowTopPreferenceKey.self) { positions in
+                guard !posts.isEmpty else { onUpdateAnchor(nil, posts); return }
+                // Pick the item whose top is just below the top edge (>= threshold),
+                // otherwise fall back to the closest just above the edge.
+                let threshold: CGFloat = 8
+                var candidateID: String? = nil
+                var minPositive: CGFloat = .greatestFiniteMagnitude
+                var maxNegative: CGFloat = -.greatestFiniteMagnitude
+                var negativeCandidate: String? = nil
+
+                for p in posts {
+                    guard let y = positions[p.id] else { continue }
+                    if y >= threshold {
+                        if y < minPositive { minPositive = y; candidateID = p.id }
+                    } else {
+                        if y > maxNegative { maxNegative = y; negativeCandidate = p.id }
+                    }
+                }
+
+                onUpdateAnchor(candidateID ?? negativeCandidate, posts)
+            }
             .onChange(of: pendingScrollToID) { _, new in
                 guard let id = new else { return }
                 jumpInProgress = true

@@ -44,6 +44,45 @@ struct MastodonClient: SocialClient {
         return (mapped, nextCursor)
     }
 
+    // Fetch newer statuses than the given since_id (Mastodon supports this natively).
+    // Returns newest-first posts and does not include the since_id item itself.
+    func fetchHomeTimelineSince(sinceID: String) async throws -> [UnifiedPost] {
+        guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw URLError(.badURL)
+        }
+        comps.path = "/api/v1/timelines/home"
+        // Mastodon returns newest-first by default; using since_id will fetch items with id > since_id
+        comps.queryItems = [
+            URLQueryItem(name: "limit", value: "40"),
+            URLQueryItem(name: "since_id", value: sinceID)
+        ]
+        guard let url = comps.url else { throw URLError(.badURL) }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        let statuses = try JSONDecoder().decode([MastoStatus].self, from: data)
+        var mapped = statuses.map { mapStatusToUnified($0) }
+        // Enrich quotes in the new batch (bounded)
+        var remainingQuoteFetches = maxQuoteEnrichmentsPerPage
+        for i in 0..<min(statuses.count, mapped.count) {
+            if remainingQuoteFetches <= 0 { break }
+            if mapped[i].quotedPost == nil, let link = extractLinkedStatus(fromHTML: statuses[i].content) {
+                remainingQuoteFetches -= 1
+                if let qp = try await fetchQuotedStatus(host: link.host, id: link.id) {
+                    mapped[i].quotedPost = qp
+                }
+            }
+        }
+        return mapped
+    }
+
     // Try to find a linked Mastodon status URL in the content HTML.
     // Supports patterns like:
     //  - https://example.org/@user/123456789

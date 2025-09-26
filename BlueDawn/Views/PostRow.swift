@@ -375,12 +375,27 @@ struct PostRow: View {
         }
     }
 
-    // First external http(s) link in the attributed text
+    // First external http(s) link in the attributed text, excluding @-mentions
     private var firstExternalLink: URL? {
         for run in post.text.runs {
-            if let url = run.link, let scheme = url.scheme?.lowercased(), (scheme == "http" || scheme == "https") {
-                return url
+            guard let url = run.link,
+                  let scheme = url.scheme?.lowercased(), (scheme == "http" || scheme == "https") else { continue }
+
+            // Heuristic 1: if the visible text for this run starts with '@', treat as a mention and skip
+            let range = run.range
+            let segment = post.text[range]
+            let visible = String(segment.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+            if visible.hasPrefix("@") { continue }
+
+            // Heuristic 2: skip obvious profile URL shapes
+            if let host = url.host?.lowercased() {
+                // Bluesky web profile URLs
+                if host == "bsky.app" && url.path.lowercased().hasPrefix("/profile/") { continue }
+                // Mastodon profile URLs on the same instance (/@user)
+                if case .mastodon(let instance) = post.network, host == instance.lowercased(), url.path.hasPrefix("/@") { continue }
             }
+
+            return url
         }
         return nil
     }
