@@ -57,21 +57,19 @@ struct PostDetailView: View {
                                 }
                                 .buttonStyle(.plain)
 
-                                // Content → Post detail
-                                NavigationLink {
-                                    PostDetailView(post: anc, viewModel: ThreadViewModel(session: session, root: anc))
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(anc.authorDisplayName?.isEmpty == false ? anc.authorDisplayName! : anc.authorHandle)
-                                            .font(.headline.weight(.semibold))
-                                            .lineLimit(1)
-                                        Text(anc.text)
-                                            .font(.body)
-                                            .foregroundStyle(.primary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                }
-                                .buttonStyle(.plain)
+                        // Content → programmatic navigation to preserve nested interactions
+                        PostRow(
+                            post: anc,
+                            showAvatar: false,
+                            onOpenProfile: { net, handle in
+                                profileRoute = ProfileRoute(network: net, handle: handle)
+                            },
+                            onOpenPost: { p in
+                                postSelection = p
+                            }
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture { postSelection = anc }
 
                                 Spacer(minLength: 0)
                             }
@@ -85,6 +83,9 @@ struct PostDetailView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     header
                     content
+                    if let link = firstExternalLink, !hasAnyMedia, post.quotedPost == nil {
+                        LinkPreviewView(url: link)
+                    }
                     if let quoted = post.quotedPost {
                         QuotedPostCard(post: quoted, onOpenPost: { q in
                             postSelection = q
@@ -136,9 +137,18 @@ struct PostDetailView: View {
                         }
                     }
                     if host == "bsky.app" && path.hasPrefix("/profile/") {
-                        let handle = String(path.dropFirst("/profile/".count))
-                        profileRoute = ProfileRoute(network: .bluesky, handle: handle)
-                        return .handled
+                        let comps = path.split(separator: "/").map(String.init)
+                        if comps.count >= 4 && comps[0] == "profile" && comps[2] == "post" {
+                            let actor = comps[1]
+                            let rkey = comps[3]
+                            Task { await openBlueskyStatus(actor: actor, rkey: rkey, originalURL: url) }
+                            return .handled
+                        }
+                        if comps.count >= 2 && comps[0] == "profile" {
+                            let actor = comps[1]
+                            profileRoute = ProfileRoute(network: .bluesky, handle: actor)
+                            return .handled
+                        }
                     }
                     // Non-profile web links
                     if session.openLinksInApp {
@@ -305,17 +315,19 @@ struct PostDetailView: View {
                     }
                     .buttonStyle(.plain)
 
-                    // Content → Post detail
-                    NavigationLink {
-                        PostDetailView(post: item.post, viewModel: ThreadViewModel(session: session, root: item.post))
-                    } label: {
-                        PostRow(post: item.post, showAvatar: false, onOpenProfile: { net, handle in
+                    // Content → programmatic navigation to avoid nested link issues
+                    PostRow(
+                        post: item.post,
+                        showAvatar: false,
+                        onOpenProfile: { net, handle in
                             profileRoute = ProfileRoute(network: net, handle: handle)
-                        }, onOpenPost: { q in
+                        },
+                        onOpenPost: { q in
                             postSelection = q
-                        })
-                    }
-                    .buttonStyle(.plain)
+                        }
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture { postSelection = item.post }
 
                     Spacer(minLength: 0)
                 }
@@ -487,6 +499,18 @@ struct PostDetailView: View {
         return df.string(from: date)
     }
 
+    // First external http(s) link in the attributed text
+    private var firstExternalLink: URL? {
+        for run in post.text.runs {
+            if let url = run.link, let scheme = url.scheme?.lowercased(), (scheme == "http" || scheme == "https") {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private var hasAnyMedia: Bool { !post.media.isEmpty }
+
     private func extractMastoStatusID(fromPath path: String) -> String? {
         let comps = path.split(separator: "/").map(String.init)
         if comps.count >= 2, comps[0].hasPrefix("@") {
@@ -511,6 +535,23 @@ struct PostDetailView: View {
             return
         }
         // Fallback
+        #if canImport(SafariServices) && canImport(UIKit)
+        if session.openLinksInApp { safariURL = originalURL }
+        #endif
+    }
+
+    @MainActor
+    private func openBlueskyStatus(actor: String, rkey: String, originalURL: URL?) async {
+        guard let client = session.blueskyClient else {
+            #if canImport(SafariServices) && canImport(UIKit)
+            if session.openLinksInApp { safariURL = originalURL }
+            #endif
+            return
+        }
+        if let post = try? await client.fetchPost(actorOrHandle: actor, rkey: rkey) {
+            postSelection = post
+            return
+        }
         #if canImport(SafariServices) && canImport(UIKit)
         if session.openLinksInApp { safariURL = originalURL }
         #endif

@@ -12,6 +12,8 @@ struct PostRow: View {
     var onTapImage: ((UnifiedPost, Int) -> Void)? = nil
     // Notify parent when an external web URL should be opened (non-profile links)
     var onOpenExternalURL: ((URL) -> Void)? = nil
+    // When true, use tighter internal padding (timeline supplies outer padding)
+    var compactPadding: Bool = false
 
     @ViewBuilder private var shareBanner: some View {
         if post.isRepostOrBoost, let name = post.boostedByDisplayName ?? post.boostedByHandle {
@@ -67,15 +69,7 @@ struct PostRow: View {
         }
     }
 
-    // Subtle network-specific background tint
-    private var backgroundTint: Color {
-        switch post.network {
-        case .bluesky:
-            return Color.blue.opacity(0.06)
-        case .mastodon:
-            return Color.purple.opacity(0.06)
-        }
-    }
+    // Background tint handled by container (e.g., TimelineRow)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -83,10 +77,10 @@ struct PostRow: View {
             crossPostBadge
             header
             content
-            if let link = firstExternalLink, !hasAnyMedia {
+            if let link = firstExternalLink, !hasAnyMedia, post.quotedPost == nil {
                 // Tappable rich link preview (uses environment openURL handler)
                 Button {
-                    _ = openURL(link)
+                    openURL(link)
                 } label: {
                     LinkPreviewView(url: link)
                 }
@@ -98,15 +92,8 @@ struct PostRow: View {
             if !post.media.isEmpty { mediaStrip }
             actionBar
         }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 12)
-        .background(backgroundTint)
-        // Thin separator line at the bottom to delineate posts
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.secondary.opacity(0.18))
-                .frame(height: 0.5)
-        }
+        .padding(.vertical, compactPadding ? 0 : 10)
+        .padding(.horizontal, compactPadding ? 0 : 12)
         // Handle taps on links inside attributed text for mentions/user profiles
         .environment(\.openURL, OpenURLAction { url in
             handleOpenURL(url)
@@ -440,10 +427,21 @@ private extension PostRow {
                     if !acct.isEmpty { onOpenProfile?(.mastodon(instance: host), acct); return .handled }
                 }
             }
-            // Bluesky web profile links: https://bsky.app/profile/<handle>
+            // Bluesky web links (profile or post): https://bsky.app/profile/<actor>[/post/<rkey>]
             if host == "bsky.app" && path.hasPrefix("/profile/") {
-                let handle = String(path.dropFirst("/profile/".count))
-                if !handle.isEmpty { onOpenProfile?(.bluesky, handle); return .handled }
+                let comps = path.split(separator: "/").map(String.init)
+                if comps.count >= 4 && comps[0] == "profile" && comps[2] == "post" {
+                    let actor = comps[1]
+                    let rkey = comps[3]
+                    if !actor.isEmpty && !rkey.isEmpty {
+                        Task { await openBlueskyStatus(actor: actor, rkey: rkey, originalURL: url) }
+                        return .handled
+                    }
+                }
+                if comps.count >= 2 && comps[0] == "profile" {
+                    let actor = comps[1]
+                    if !actor.isEmpty { onOpenProfile?(.bluesky, actor); return .handled }
+                }
             }
         }
 
@@ -458,6 +456,27 @@ private extension PostRow {
         }
 
         return .systemAction
+    }
+
+    @MainActor
+    func openBlueskyStatus(actor: String, rkey: String, originalURL: URL?) async {
+        guard let client = session.blueskyClient else {
+            if let u = originalURL { if session.openLinksInApp { onOpenExternalURL?(u) } }
+            return
+        }
+        do {
+            if let post = try await client.fetchPost(actorOrHandle: actor, rkey: rkey) {
+                onOpenPost?(post)
+                return
+            }
+        } catch {
+            // ignore
+        }
+        if let u = originalURL {
+            if session.openLinksInApp {
+                onOpenExternalURL?(u)
+            }
+        }
     }
 
     func extractMastoStatusID(fromPath path: String) -> String? {

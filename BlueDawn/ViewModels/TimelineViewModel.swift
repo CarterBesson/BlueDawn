@@ -175,14 +175,16 @@ final class TimelineViewModel {
     }
 
     private func applyFilter() {
+        // Temporarily disable thread grouping to simplify the timeline UI
         switch filter {
         case .all:
             let merged = mastodonPosts + blueskyPosts
-            posts = groupIntoThreads(dedupeCrossPosts(merged, preference: canonicalPreference))
+            posts = dedupeCrossPosts(merged, preference: canonicalPreference)
+                .sorted { $0.createdAt > $1.createdAt }
         case .bluesky:
-            posts = groupIntoThreads(blueskyPosts.sorted { $0.createdAt > $1.createdAt })
+            posts = blueskyPosts.sorted { $0.createdAt > $1.createdAt }
         case .mastodon:
-            posts = groupIntoThreads(mastodonPosts.sorted { $0.createdAt > $1.createdAt })
+            posts = mastodonPosts.sorted { $0.createdAt > $1.createdAt }
         }
     }
 
@@ -410,11 +412,12 @@ final class TimelineViewModel {
     }
 
     // MARK: - Cross-post de-duplication
-    private let crossPostWindow: TimeInterval = 30 * 60 // 30 minutes
+    // Expand window to better catch delayed cross-posts across services
+    private let crossPostWindow: TimeInterval = 6 * 60 * 60 // 6 hours
 
     private func dedupeCrossPosts(_ all: [UnifiedPost],
                                   preference: CanonicalPreference) -> [UnifiedPost] {
-        // Group by a conservative signature: author + normalized text + media hint
+        // Group by a conservative signature: author local handle + normalized text + media hint
         var buckets: [String: [UnifiedPost]] = [:]
         for p in all {
             let key = crossSignature(for: p)
@@ -425,6 +428,9 @@ final class TimelineViewModel {
         for (_, group) in buckets {
             // Sort by time and create clusters within the window
             let sorted = group.sorted { $0.createdAt < $1.createdAt }
+            // Use a shorter window for link-only bodies to avoid over-merging
+            let bodyForWindow = normalizeBody(sorted.first?.text ?? AttributedString(""))
+            let window = bodyForWindow.isEmpty ? min(crossPostWindow, 90 * 60) : crossPostWindow
             var cluster: [UnifiedPost] = []
             var anchor: UnifiedPost?
 
@@ -437,7 +443,7 @@ final class TimelineViewModel {
 
             for post in sorted {
                 if let a = anchor {
-                    if abs(post.createdAt.timeIntervalSince(a.createdAt)) <= crossPostWindow {
+                    if abs(post.createdAt.timeIntervalSince(a.createdAt)) <= window {
                         cluster.append(post)
                     } else {
                         flushCluster()
@@ -484,10 +490,24 @@ final class TimelineViewModel {
     }
 
     private func crossSignature(for p: UnifiedPost) -> String {
-        let author = normalizeAuthor(p)
+        let author = authorKey(p)
         let body   = normalizeBody(p.text)
         let mediaCount = p.media.count // robust across services (ignores differing CDN filenames)
         return "\(author)|\(body)|n\(mediaCount)"
+    }
+
+    // Try to map an author's handle across services to a stable local username
+    private func authorKey(_ p: UnifiedPost) -> String {
+        let handle = p.authorHandle.lowercased()
+        var local = handle
+        if let atIndex = handle.firstIndex(of: "@") {
+            // Mastodon: acct may be "user" or "user@instance" → take local part
+            local = String(handle[..<atIndex])
+        } else if handle.contains(".") {
+            // Bluesky: handle like "user.bsky.social" → take first label
+            local = String(handle.split(separator: ".").first ?? Substring(handle))
+        }
+        return local.replacingOccurrences(of: #"[^\p{L}\p{N}]"#, with: "", options: .regularExpression)
     }
 
     private func normalizeAuthor(_ p: UnifiedPost) -> String {
@@ -499,7 +519,10 @@ final class TimelineViewModel {
 
     private func normalizeBody(_ a: AttributedString) -> String {
         var s = String(a.characters).lowercased()
+        // Strip links entirely so shortened vs full URLs match
         s = s.replacingOccurrences(of: #"https?://\S+"#, with: "", options: .regularExpression)
+        // Remove any common URL-like tokens that might slip through (e.g., www.example.com)
+        s = s.replacingOccurrences(of: #"\b(?:www\.)?[-a-z0-9@:%._+~#=]{2,256}\.[a-z]{2,63}\b[^\s]*"#, with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: #"(?<!\w)[@#][\p{L}0-9_.-]+"#, with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: #"[^\p{L}\p{N}\s]"#, with: " ", options: .regularExpression)
         s = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)

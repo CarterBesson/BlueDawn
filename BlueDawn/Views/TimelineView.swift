@@ -20,6 +20,7 @@ struct HomeTimelineView: View {
     @State private var imageViewer: ImageViewerState? = nil
     @State private var postSelection: UnifiedPost? = nil
     @State private var safariURL: URL? = nil
+    @State private var showMyProfiles: Bool = false
 
     private struct ProfileRoute: Identifiable, Hashable {
         let id = UUID()
@@ -77,18 +78,7 @@ struct HomeTimelineView: View {
             ToolbarItem(placement: .topBarLeading) {
                 // Profile avatar with quick actions
                 Menu {
-                    if let h = session.signedInHandleBluesky {
-                        Button("View Profile") {
-                            profileRoute = ProfileRoute(network: .bluesky, handle: h)
-                        }
-                    } else if let h = session.signedInHandleMastodon {
-                        Button("View Profile") {
-                            if let client = session.mastodonClient {
-                                let instance = client.baseURL.host ?? client.baseURL.absoluteString
-                                profileRoute = ProfileRoute(network: .mastodon(instance: instance), handle: h)
-                            }
-                        }
-                    }
+                    Button("View Profile") { showMyProfiles = true }
                     NavigationLink(destination: SettingsView()) {
                         Label("Settings", systemImage: "gearshape")
                     }
@@ -102,7 +92,9 @@ struct HomeTimelineView: View {
                 }
             }
         }
-        .task { await viewModel.refresh() }
+        .navigationDestination(isPresented: $showMyProfiles) {
+            MyProfilesView()
+        }
     }
 }
 
@@ -154,6 +146,7 @@ struct TimelineList: View {
                 }
             }
             .listStyle(.plain)
+            .listRowSpacing(0)
             .scrollIndicators(.automatic)
             .refreshable { await onRefresh() }
             .scrollPosition(id: $anchorID, anchor: .top)

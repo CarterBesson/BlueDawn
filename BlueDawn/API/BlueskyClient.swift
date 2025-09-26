@@ -123,6 +123,37 @@ struct BlueskyClient: SocialClient {
         return stack.reversed()
     }
 
+    // MARK: - Fetch a single post by actor/rkey (from bsky.app link)
+    func fetchPost(actorOrHandle actor: String, rkey: String) async throws -> UnifiedPost? {
+        // Resolve handle to DID if needed
+        let did = try await resolveDID(for: actor)
+        var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/xrpc/app.bsky.feed.getPostThread"
+        let atUri = "at://\(did)/app.bsky.feed.post/\(rkey)"
+        comps?.queryItems = [URLQueryItem(name: "uri", value: atUri)]
+        guard let url = comps?.url else { throw URLError(.badURL) }
+
+        let data = try await performGET(url)
+        let decoder = JSONDecoder()
+        let resp = try decoder.decode(GetPostThreadResponse.self, from: data)
+        if case let .threadViewPost(node) = resp.thread {
+            return mapPostToUnified(node.post)
+        }
+        return nil
+    }
+
+    private func resolveDID(for actorOrDid: String) async throws -> String {
+        if actorOrDid.hasPrefix("did:") { return actorOrDid }
+        var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/xrpc/com.atproto.identity.resolveHandle"
+        comps?.queryItems = [URLQueryItem(name: "handle", value: actorOrDid)]
+        guard let url = comps?.url else { throw URLError(.badURL) }
+        struct Resp: Decodable { let did: String }
+        let data = try await performGET(url)
+        let r = try JSONDecoder().decode(Resp.self, from: data)
+        return r.did
+    }
+
     // MARK: - Profile
     func fetchUserProfile(handle: String) async throws -> UnifiedUser {
         var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)

@@ -92,6 +92,7 @@ struct LinkPreviewView: View {
     var onTap: ((URL) -> Void)? = nil
     var style: LinkPreviewStyle = .compact
 
+    @Environment(\.openURL) private var openURL
     @StateObject private var loader: LinkMetadataLoader
     @State private var thumbnail: UIImage? = nil
 
@@ -136,7 +137,9 @@ struct LinkPreviewView: View {
                 case .compact:
                     compactRow(meta)
                         .contentShape(Rectangle())
-                        .onTapGesture { onTap?(url) }
+                        .onTapGesture {
+                            if let onTap { onTap(url) } else { openURL(url) }
+                        }
                         .onAppear { Self.loadThumbnailIfNeeded(meta: meta, url: url) { thumbnail = $0 } }
                         .onChange(of: loader.metadata?.url) { _, _ in
                             guard let meta = loader.metadata else { return }
@@ -147,13 +150,17 @@ struct LinkPreviewView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .clipped()
                     Color.clear.contentShape(Rectangle())
-                        .onTapGesture { onTap?(url) }
+                        .onTapGesture {
+                            if let onTap { onTap(url) } else { openURL(url) }
+                        }
                 }
             } else if loader.isLoading {
                 skeleton
             } else {
                 fallback
-                    .onTapGesture { onTap?(url) }
+                    .onTapGesture {
+                        if let onTap { onTap(url) } else { openURL(url) }
+                    }
             }
         }
         .frame(maxWidth: .infinity)

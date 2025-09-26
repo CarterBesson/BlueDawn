@@ -17,6 +17,12 @@ struct SettingsView: View {
                     } label: {
                         Label("Accounts", systemImage: "person.2")
                     }
+
+                    NavigationLink {
+                        SettingsSwipeActionsView()
+                    } label: {
+                        Label("Swipe Actions", systemImage: "hand.draw")
+                    }
                 }
 
                 Section("Appearance") {

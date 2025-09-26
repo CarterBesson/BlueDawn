@@ -47,6 +47,11 @@ final class SessionStore {
     private let UD_VIDEO_START_MUTED = "bd.video.startMuted"
     private let UD_VIDEO_AUTOPLAY = "bd.video.autoplay"
     private let UD_VIDEO_LOOP = "bd.video.loop"
+    // Swipe actions
+    private let UD_SWIPE_LEADING_SHORT = "bd.swipe.leading.short"
+    private let UD_SWIPE_LEADING_LONG  = "bd.swipe.leading.long"
+    private let UD_SWIPE_TRAILING_SHORT = "bd.swipe.trailing.short"
+    private let UD_SWIPE_TRAILING_LONG  = "bd.swipe.trailing.long"
 
     // MARK: - JWT helpers
     private func jwtExpirationDate(_ jwt: String) -> Date? {
@@ -85,6 +90,51 @@ final class SessionStore {
     }() {
         didSet { UserDefaults.standard.set(videoStartMuted, forKey: UD_VIDEO_START_MUTED) }
     }
+
+    // MARK: - Swipe Actions
+    enum SwipeAction: String, CaseIterable, Identifiable {
+        case none, reply, like, repost, bookmark
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .none: return "None"
+            case .reply: return "Reply"
+            case .like: return "Like/Favorite"
+            case .repost: return "Repost/Boost"
+            case .bookmark: return "Bookmark"
+            }
+        }
+        var systemImage: String {
+            switch self {
+            case .none: return "minus.circle"
+            case .reply: return "bubble.left"
+            case .like: return "heart"
+            case .repost: return "arrow.2.squarepath"
+            case .bookmark: return "bookmark"
+            }
+        }
+    }
+
+    // Defaults: right swipe (trailing) long = like, short = repost; left swipe (leading) long = bookmark, short = reply
+    var swipeLeadingShort: SwipeAction = {
+        if let raw = UserDefaults.standard.string(forKey: "bd.swipe.leading.short"), let v = SwipeAction(rawValue: raw) { return v }
+        return .reply
+    }() { didSet { UserDefaults.standard.set(swipeLeadingShort.rawValue, forKey: UD_SWIPE_LEADING_SHORT) } }
+
+    var swipeLeadingLong: SwipeAction = {
+        if let raw = UserDefaults.standard.string(forKey: "bd.swipe.leading.long"), let v = SwipeAction(rawValue: raw) { return v }
+        return .bookmark
+    }() { didSet { UserDefaults.standard.set(swipeLeadingLong.rawValue, forKey: UD_SWIPE_LEADING_LONG) } }
+
+    var swipeTrailingShort: SwipeAction = {
+        if let raw = UserDefaults.standard.string(forKey: "bd.swipe.trailing.short"), let v = SwipeAction(rawValue: raw) { return v }
+        return .repost
+    }() { didSet { UserDefaults.standard.set(swipeTrailingShort.rawValue, forKey: UD_SWIPE_TRAILING_SHORT) } }
+
+    var swipeTrailingLong: SwipeAction = {
+        if let raw = UserDefaults.standard.string(forKey: "bd.swipe.trailing.long"), let v = SwipeAction(rawValue: raw) { return v }
+        return .like
+    }() { didSet { UserDefaults.standard.set(swipeTrailingLong.rawValue, forKey: UD_SWIPE_TRAILING_LONG) } }
 
     // Autoplay videos when the view appears
     var videoAutoplay: Bool = {

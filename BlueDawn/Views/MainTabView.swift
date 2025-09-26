@@ -20,7 +20,6 @@ struct MainTabView: View {
                         .navigationBarTitleDisplayMode(.large)
                 }
             }
-            
             Tab(role: .search) {
                 NavigationStack {
                     // Replace with your actual search view when available
