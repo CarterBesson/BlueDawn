@@ -140,9 +140,19 @@ final class TimelineViewModel {
         applyFilter()
         persist()
 
-        // Surface an error only if both failed
-        if case .failure = mResult, case .failure(let bErr) = bResult {
-            self.error = (bErr as? LocalizedError)?.errorDescription ?? bErr.localizedDescription
+        // Surface an error if either provider failed, with source labels
+        var messages: [String] = []
+        if case .failure(let mErr) = mResult {
+            let msg = (mErr as? LocalizedError)?.errorDescription ?? mErr.localizedDescription
+            messages.append("Mastodon: \(msg)")
+        }
+        if case .failure(let bErr) = bResult {
+            let msg = (bErr as? LocalizedError)?.errorDescription ?? bErr.localizedDescription
+            messages.append("Bluesky: \(msg)")
+        }
+        if !messages.isEmpty {
+            self.error = messages.joined(separator: "\n")
+            print("[Timeline] refresh errors ->\n\(self.error!)")
         }
     }
 
@@ -166,7 +176,11 @@ final class TimelineViewModel {
                 let (page, next) = try await client.fetchHomeTimeline(cursor: mastodonBottomCursor)
                 mastodonBottomCursor = next ?? mastodonBottomCursor
                 fetched.append(contentsOf: page)
-            } catch { /* ignore mastodon errors here */ }
+            } catch {
+                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                self.error = "Mastodon: \(msg)"
+                print("[Timeline] loadMore mastodon error: \(msg)")
+            }
         }
 
         // Older Bluesky page using cursor
@@ -182,6 +196,13 @@ final class TimelineViewModel {
                         blueskyBottomCursor = next ?? blueskyBottomCursor
                         fetched.append(contentsOf: page)
                     } else { session.signOutBluesky() }
+                    let msg = (error as? LocalizedError)?.errorDescription ?? "Unauthorized"
+                    self.error = "Bluesky: \(msg)"
+                    print("[Timeline] loadMore bluesky 401/error: \(msg)")
+                } else {
+                    let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.error = "Bluesky: \(msg)"
+                    print("[Timeline] loadMore bluesky error: \(msg)")
                 }
             }
         }
@@ -194,12 +215,14 @@ final class TimelineViewModel {
     // MARK: - Persistence
     func loadPersisted() async -> String? {
         if let saved = TimelinePersistence.load() {
-            allPosts = saved.posts
-            idSet = Set(saved.posts.map { $0.id })
+            let deduped = Normalizer.dedupe(saved.posts)
+            allPosts = deduped
+            idSet = Set(deduped.map { $0.id })
             mastodonBottomCursor = saved.meta.mastodonBottomCursor
             blueskyBottomCursor = saved.meta.blueskyBottomCursor
             mastodonNewestID = saved.meta.mastodonNewestID
             currentAnchorID = saved.meta.anchorPostID
+            if deduped.count != saved.posts.count { persist(anchorID: saved.meta.anchorPostID) }
             applyFilter()
             return saved.meta.anchorPostID
         }

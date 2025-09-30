@@ -77,7 +77,7 @@ struct PostRow: View {
             crossPostBadge
             header
             content
-            if let link = firstExternalLink, !hasAnyMedia, post.quotedPost == nil {
+            if let link = externalLinkForPreview, !hasAnyMedia, post.quotedPost == nil {
                 // Tappable rich link preview (uses environment openURL handler)
                 Button {
                     openURL(link)
@@ -400,6 +400,11 @@ struct PostRow: View {
             return url
         }
         return nil
+    }
+
+    // Prefer a link from the text; fall back to embedded external URL (e.g., Bluesky card)
+    private var externalLinkForPreview: URL? {
+        return firstExternalLink ?? post.externalURL
     }
 
     private var hasAnyMedia: Bool { !post.media.isEmpty }

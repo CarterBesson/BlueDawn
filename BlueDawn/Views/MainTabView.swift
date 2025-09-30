@@ -11,8 +11,6 @@ struct MainTabView: View {
             Group {
                 if let vm = viewModel {
                     HomeTimelineView(viewModel: vm)
-                        .navigationTitle("Home")
-                        .navigationBarTitleDisplayMode(.large)
                         .overlay(alignment: .bottomLeading) { filterFAB(vm) }
                         .overlay(alignment: .bottomTrailing) { searchFAB() }
                 } else {

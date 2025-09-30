@@ -108,7 +108,8 @@ struct QuotedPostCard: View {
             crossPostAlternates: nil,
             isCrossPostCanonical: false,
             threadPreview: nil,
-            quotedPost: nil
+            quotedPost: nil,
+            externalURL: nil
         )
     }
 }

@@ -22,6 +22,7 @@ struct HomeTimelineView: View {
     @State private var safariURL: URL? = nil
     @State private var showMyProfiles: Bool = false
     @State private var didInitialRestore: Bool = false
+    @State private var toastText: String? = nil
 
     private struct ProfileRoute: Identifiable, Hashable {
         let id = UUID()
@@ -58,7 +59,21 @@ struct HomeTimelineView: View {
                 safariURL = url
                 #endif
             },
-            onRefresh: { await viewModel.refresh() },
+            onRefresh: {
+                // Preserve current anchor and explicitly restore it after refresh
+                let preserved = anchorID
+                jumpInProgress = true
+                await viewModel.refresh()
+                if let preserved {
+                    // Reassert anchor and request a programmatic scroll to neutralize any jump
+                    anchorID = preserved
+                    pendingScrollToID = preserved
+                }
+                // Allow any scroll animation to settle before resuming anchor updates
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    jumpInProgress = false
+                }
+            },
             onUpdateAnchor: { topVisibleID, items in
                 // Avoid updating the saved anchor while jumping or refreshing
                 if !didInitialRestore || jumpInProgress || viewModel.isLoading { return }
@@ -68,7 +83,6 @@ struct HomeTimelineView: View {
                 viewModel.updateAnchorPostID(anchorID)
             }
         )
-        .navigationTitle("Home")
         .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
             ImageViewer(post: selection.post, startIndex: selection.index)
         }
@@ -106,6 +120,38 @@ struct HomeTimelineView: View {
                 .buttonStyle(.plain)
                 .padding(.top, 8)
                 .padding(.trailing, 12)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if let t = toastText {
+                HStack(spacing: 8) {
+                    Text(t)
+                        .font(.footnote)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .foregroundStyle(.primary)
+                    Button {
+                        withAnimation { toastText = nil }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.secondary)
+                            .padding(6)
+                            .background(.thinMaterial, in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss message")
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(.ultraThinMaterial, in: Capsule())
+                .overlay(
+                    Capsule().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
+                )
+                .padding(.horizontal, 16)
+                // Lift above bottom FABs (≈ 52 size + 16 padding + gap)
+                .padding(.bottom, 96)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .toolbar {
@@ -149,6 +195,11 @@ struct HomeTimelineView: View {
                 anchorID = topID
                 pendingScrollToID = topID
             }
+        }
+        .onChange(of: viewModel.error) { _, new in
+            guard let msg = new, !msg.isEmpty else { return }
+            Haptics.notify(.error)
+            withAnimation { toastText = msg }
         }
     }
 }
@@ -226,19 +277,18 @@ struct TimelineList: View {
                 let threshold: CGFloat = 8
                 var candidateID: String? = nil
                 var minPositive: CGFloat = .greatestFiniteMagnitude
-                var maxNegative: CGFloat = -.greatestFiniteMagnitude
-                var negativeCandidate: String? = nil
 
                 for p in posts {
                     guard let y = positions[p.id] else { continue }
                     if y >= threshold {
                         if y < minPositive { minPositive = y; candidateID = p.id }
-                    } else {
-                        if y > maxNegative { maxNegative = y; negativeCandidate = p.id }
                     }
                 }
 
-                onUpdateAnchor(candidateID ?? negativeCandidate, posts)
+                // Only update anchor when a row is actually visible at/near the top.
+                // Do NOT fall back to an offscreen (negative-Y) row, since that
+                // would cause jumps after prepending new items during refresh.
+                onUpdateAnchor(candidateID, posts)
             }
             .onChange(of: pendingScrollToID) { _, new in
                 guard let id = new else { return }

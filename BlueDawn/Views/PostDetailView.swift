@@ -98,7 +98,7 @@ struct PostDetailView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     header
                     content
-                    if let link = firstExternalLink, !hasAnyMedia, post.quotedPost == nil {
+                    if let link = externalLinkForPreview, !hasAnyMedia, post.quotedPost == nil {
                         LinkPreviewView(url: link)
                     }
                     if let quoted = post.quotedPost {
@@ -270,27 +270,51 @@ struct PostDetailView: View {
     private var mediaGrid: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)], spacing: 10) {
             ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
-                Button {
-                    imageViewer = ImageViewerState(post: post, index: idx)
-                } label: {
-                    AsyncImage(url: m.url) { phase in
-                        switch phase {
-                        case .empty:
-                            Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
-                        case .success(let image):
-                            image.resizable().scaledToFill()
-                        case .failure:
-                            Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo"))
-                        @unknown default:
-                            Rectangle().fill(Color.secondary.opacity(0.15))
+                Group {
+                    switch m.kind {
+                    case .image:
+                        Button { imageViewer = ImageViewerState(post: post, index: idx) } label: {
+                            AsyncImage(url: m.url) { phase in
+                                switch phase {
+                                case .empty:
+                                    Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
+                                case .success(let image):
+                                    image.resizable().scaledToFill()
+                                case .failure:
+                                    Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo"))
+                                @unknown default:
+                                    Rectangle().fill(Color.secondary.opacity(0.15))
+                                }
+                            }
                         }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(m.altText ?? "Image")
+                    case .video, .gif:
+                        ZStack {
+                            InlineVideoView(url: m.url)
+                            // Fullscreen button overlay
+                            VStack { Spacer() }
+                                .overlay(alignment: .bottomTrailing) {
+                                    Button {
+                                        NotificationCenter.default.post(name: Notification.Name("InlineVideoPauseAll"), object: nil)
+                                        imageViewer = ImageViewerState(post: post, index: idx)
+                                    } label: {
+                                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .padding(8)
+                                            .background(.ultraThinMaterial, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .padding(8)
+                                    .accessibilityLabel("Open full screen")
+                                }
+                        }
+                        .accessibilityLabel(m.altText ?? "Video")
                     }
-                    .frame(height: 200)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
                 }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
+                .frame(height: 200)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
             }
         }
     }
@@ -549,6 +573,11 @@ struct PostDetailView: View {
             return url
         }
         return nil
+    }
+
+    // Prefer a link from the text; fall back to embedded external URL (e.g., Bluesky card)
+    private var externalLinkForPreview: URL? {
+        return firstExternalLink ?? post.externalURL
     }
 
     private var hasAnyMedia: Bool { !post.media.isEmpty }
