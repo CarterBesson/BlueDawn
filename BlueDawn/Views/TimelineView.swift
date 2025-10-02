@@ -13,7 +13,6 @@ struct HomeTimelineView: View {
     }
 
     // Minimal state required by TimelineList
-    @State private var visibleIDs: Set<String> = []
     @State private var anchorID: String? = nil
     @State private var pendingScrollToID: String? = nil
     @State private var jumpInProgress = false
@@ -46,7 +45,6 @@ struct HomeTimelineView: View {
             onOpenPost: { post in
                 postSelection = post
             },
-            visibleIDs: $visibleIDs,
             anchorID: $anchorID,
             pendingScrollToID: $pendingScrollToID,
             jumpInProgress: $jumpInProgress,
@@ -73,14 +71,6 @@ struct HomeTimelineView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
                     jumpInProgress = false
                 }
-            },
-            onUpdateAnchor: { topVisibleID, items in
-                // Avoid updating the saved anchor while jumping or refreshing
-                if !didInitialRestore || jumpInProgress || viewModel.isLoading { return }
-                guard let topID = topVisibleID else { return }
-                if anchorID == topID { return }
-                anchorID = topID
-                viewModel.updateAnchorPostID(anchorID)
             }
         )
         .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
@@ -89,6 +79,11 @@ struct HomeTimelineView: View {
         #if canImport(SafariServices) && canImport(UIKit)
         .sheet(isPresented: Binding(get: { safariURL != nil }, set: { if !$0 { safariURL = nil } })) {
             if let url = safariURL { SafariView(url: url) }
+        }
+        .onChange(of: anchorID) { old, new in
+            if !didInitialRestore || jumpInProgress || viewModel.isLoading { return }
+            guard let new, new != old else { return }
+            viewModel.updateAnchorPostID(new)
         }
         #endif
         .navigationDestination(item: $postSelection) { post in
@@ -204,22 +199,12 @@ struct HomeTimelineView: View {
     }
 }
 
-
-// Tracks each row's top Y position within the list's coordinate space
-private struct RowTopPreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGFloat] = [:]
-    static func reduce(value: inout [String : CGFloat], nextValue: () -> [String : CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: { $1 })
-    }
-}
-
 struct TimelineList: View {
     let posts: [UnifiedPost]
     let isLoadingMore: Bool
     let session: SessionStore
     let onItemAppear: (Int) -> Void
     let onOpenPost: (UnifiedPost) -> Void
-    @Binding var visibleIDs: Set<String>
     @Binding var anchorID: String?
     @Binding var pendingScrollToID: String?
     @Binding var jumpInProgress: Bool
@@ -227,12 +212,11 @@ struct TimelineList: View {
     let onTapImage: (UnifiedPost, Int) -> Void
     let onOpenExternalURL: (URL) -> Void
     let onRefresh: () async -> Void
-    let onUpdateAnchor: (_ topVisibleID: String?, _ items: [UnifiedPost]) -> Void
 
     var body: some View {
         ScrollViewReader { proxy in
             List {
-                ForEach(posts) { post in
+                ForEach(Array(posts.enumerated()), id: \.element.id) { index, post in
                     TimelineRow(
                         post: post,
                         session: session,
@@ -242,18 +226,8 @@ struct TimelineList: View {
                         onOpenExternalURL: onOpenExternalURL
                     )
                     .id(post.id)
-                    .background(
-                        GeometryReader { geo in
-                            // Report each row's top Y in the list's coordinate space
-                            Color.clear.preference(key: RowTopPreferenceKey.self, value: [post.id: geo.frame(in: .named("timelineList")).minY])
-                        }
-                    )
                     .onAppear {
-                        if let idx = posts.firstIndex(where: { $0.id == post.id }) { onItemAppear(idx) }
-                        visibleIDs.insert(post.id)
-                    }
-                    .onDisappear {
-                        visibleIDs.remove(post.id)
+                        onItemAppear(index)
                     }
                 }
 
@@ -269,27 +243,6 @@ struct TimelineList: View {
             .refreshable { await onRefresh() }
             .scrollPosition(id: $anchorID, anchor: .top)
             .transaction { if !jumpInProgress { $0.animation = nil } }
-            .coordinateSpace(name: "timelineList")
-            .onPreferenceChange(RowTopPreferenceKey.self) { positions in
-                guard !posts.isEmpty else { onUpdateAnchor(nil, posts); return }
-                // Pick the item whose top is just below the top edge (>= threshold),
-                // otherwise fall back to the closest just above the edge.
-                let threshold: CGFloat = 8
-                var candidateID: String? = nil
-                var minPositive: CGFloat = .greatestFiniteMagnitude
-
-                for p in posts {
-                    guard let y = positions[p.id] else { continue }
-                    if y >= threshold {
-                        if y < minPositive { minPositive = y; candidateID = p.id }
-                    }
-                }
-
-                // Only update anchor when a row is actually visible at/near the top.
-                // Do NOT fall back to an offscreen (negative-Y) row, since that
-                // would cause jumps after prepending new items during refresh.
-                onUpdateAnchor(candidateID, posts)
-            }
             .onChange(of: pendingScrollToID) { _, new in
                 guard let id = new else { return }
                 jumpInProgress = true

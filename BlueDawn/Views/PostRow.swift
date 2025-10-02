@@ -15,6 +15,12 @@ struct PostRow: View {
     // When true, use tighter internal padding (timeline supplies outer padding)
     var compactPadding: Bool = false
 
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
+
     @ViewBuilder private var shareBanner: some View {
         if post.isRepostOrBoost, let name = post.boostedByDisplayName ?? post.boostedByHandle {
             HStack(spacing: 6) {
@@ -410,9 +416,8 @@ struct PostRow: View {
     private var hasAnyMedia: Bool { !post.media.isEmpty }
 
     private func relativeDate(_ date: Date) -> String {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .short
-        return f.localizedString(for: date, relativeTo: Date())
+        let formatter = Self.relativeFormatter
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
