@@ -2,6 +2,7 @@ import SwiftUI
 
 struct PostRow: View {
     @Environment(SessionStore.self) private var session
+    @Environment(\.openURL) private var openURL
     let post: UnifiedPost
     var showAvatar: Bool = true
     var onOpenProfile: ((Network, String) -> Void)? = nil
@@ -11,6 +12,14 @@ struct PostRow: View {
     var onTapImage: ((UnifiedPost, Int) -> Void)? = nil
     // Notify parent when an external web URL should be opened (non-profile links)
     var onOpenExternalURL: ((URL) -> Void)? = nil
+    // When true, use tighter internal padding (timeline supplies outer padding)
+    var compactPadding: Bool = false
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter
+    }()
 
     @ViewBuilder private var shareBanner: some View {
         if post.isRepostOrBoost, let name = post.boostedByDisplayName ?? post.boostedByHandle {
@@ -66,15 +75,7 @@ struct PostRow: View {
         }
     }
 
-    // Subtle network-specific background tint
-    private var backgroundTint: Color {
-        switch post.network {
-        case .bluesky:
-            return Color.blue.opacity(0.06)
-        case .mastodon:
-            return Color.purple.opacity(0.06)
-        }
-    }
+    // Background tint handled by container (e.g., TimelineRow)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -82,21 +83,22 @@ struct PostRow: View {
             crossPostBadge
             header
             content
+            if let link = externalLinkForPreview, !hasAnyMedia, post.quotedPost == nil {
+                // Tappable rich link preview (uses environment openURL handler)
+                Button {
+                    openURL(link)
+                } label: {
+                    LinkPreviewView(url: link)
+                }
+                .buttonStyle(.plain)
+            }
             if let quoted = post.quotedPost {
                 QuotedPostCard(post: quoted, onOpenPost: { q in onOpenPost?(q) }, onOpenProfile: onOpenProfile)
             }
             if !post.media.isEmpty { mediaStrip }
-            actionBar
         }
-        .padding(.vertical, 10)
-        .padding(.horizontal, 12)
-        .background(backgroundTint)
-        // Thin separator line at the bottom to delineate posts
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color.secondary.opacity(0.18))
-                .frame(height: 0.5)
-        }
+        .padding(.vertical, compactPadding ? 0 : 10)
+        .padding(.horizontal, compactPadding ? 0 : 12)
         // Handle taps on links inside attributed text for mentions/user profiles
         .environment(\.openURL, OpenURLAction { url in
             handleOpenURL(url)
@@ -149,6 +151,9 @@ struct PostRow: View {
         Text(post.text)
             .font(.body)
             .textSelection(.enabled)
+            // Ensure long text in timeline expands and never truncates oddly
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
     }
 
     // MARK: - Media
@@ -156,36 +161,55 @@ struct PostRow: View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(spacing: 8) {
                 ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
-                    Button {
-                        onTapImage?(post, idx)
-                    } label: {
-                        AsyncImage(url: m.url) { phase in
-                            switch phase {
-                            case .empty:
-                                Rectangle().fill(Color.secondary.opacity(0.1))
-                                    .overlay(ProgressView())
-                            case .success(let image):
-                                image.resizable().scaledToFill()
-                            case .failure:
-                                Rectangle().fill(Color.secondary.opacity(0.15))
-                                    .overlay(Image(systemName: "photo").font(.title3))
-                            @unknown default:
-                                Rectangle().fill(Color.secondary.opacity(0.15))
+                    Group {
+                        switch m.kind {
+                        case .image:
+                            Button { onTapImage?(post, idx) } label: {
+                                AsyncImage(url: m.url) { phase in
+                                    switch phase {
+                                    case .empty:
+                                        Rectangle().fill(Color.secondary.opacity(0.1))
+                                            .overlay(ProgressView())
+                                    case .success(let image):
+                                        image.resizable().scaledToFill()
+                                    case .failure:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                            .overlay(Image(systemName: "photo").font(.title3))
+                                    @unknown default:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                    }
+                                }
                             }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(m.altText ?? "Image")
+                        case .video, .gif:
+                            InlineVideoView(url: m.url)
+                                .overlay(alignment: .bottomTrailing) {
+                                    Button {
+                                        NotificationCenter.default.post(name: Notification.Name("InlineVideoPauseAll"), object: nil)
+                                        onTapImage?(post, idx)
+                                    } label: {
+                                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .padding(6)
+                                            .background(.ultraThinMaterial, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .padding(6)
+                                    .accessibilityLabel("Open full screen")
+                                }
+                                .accessibilityLabel(m.altText ?? "Video")
                         }
-                        .frame(width: 160, height: 120)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-                        )
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(m.altText ?? "Image")
+                    .frame(width: 160, height: 120)
+                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
+                    )
                 }
             }
-            .padding(.top, 4)
+            
         }
     }
 
@@ -226,7 +250,7 @@ struct PostRow: View {
         }
         .font(.subheadline)
         .foregroundStyle(.secondary)
-        .padding(.top, 2)
+        .padding(.top, 0)
         .buttonStyle(.plain)
     }
 
@@ -359,10 +383,41 @@ struct PostRow: View {
         }
     }
 
+    // First external http(s) link in the attributed text, excluding @-mentions
+    private var firstExternalLink: URL? {
+        for run in post.text.runs {
+            guard let url = run.link,
+                  let scheme = url.scheme?.lowercased(), (scheme == "http" || scheme == "https") else { continue }
+
+            // Heuristic 1: if the visible text for this run starts with '@', treat as a mention and skip
+            let range = run.range
+            let segment = post.text[range]
+            let visible = String(segment.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+            if visible.hasPrefix("@") { continue }
+
+            // Heuristic 2: skip obvious profile URL shapes
+            if let host = url.host?.lowercased() {
+                // Bluesky web profile URLs
+                if host == "bsky.app" && url.path.lowercased().hasPrefix("/profile/") { continue }
+                // Mastodon profile URLs on the same instance (/@user)
+                if case .mastodon(let instance) = post.network, host == instance.lowercased(), url.path.hasPrefix("/@") { continue }
+            }
+
+            return url
+        }
+        return nil
+    }
+
+    // Prefer a link from the text; fall back to embedded external URL (e.g., Bluesky card)
+    private var externalLinkForPreview: URL? {
+        return firstExternalLink ?? post.externalURL
+    }
+
+    private var hasAnyMedia: Bool { !post.media.isEmpty }
+
     private func relativeDate(_ date: Date) -> String {
-        let f = RelativeDateTimeFormatter()
-        f.unitsStyle = .short
-        return f.localizedString(for: date, relativeTo: Date())
+        let formatter = Self.relativeFormatter
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
@@ -399,10 +454,21 @@ private extension PostRow {
                     if !acct.isEmpty { onOpenProfile?(.mastodon(instance: host), acct); return .handled }
                 }
             }
-            // Bluesky web profile links: https://bsky.app/profile/<handle>
+            // Bluesky web links (profile or post): https://bsky.app/profile/<actor>[/post/<rkey>]
             if host == "bsky.app" && path.hasPrefix("/profile/") {
-                let handle = String(path.dropFirst("/profile/".count))
-                if !handle.isEmpty { onOpenProfile?(.bluesky, handle); return .handled }
+                let comps = path.split(separator: "/").map(String.init)
+                if comps.count >= 4 && comps[0] == "profile" && comps[2] == "post" {
+                    let actor = comps[1]
+                    let rkey = comps[3]
+                    if !actor.isEmpty && !rkey.isEmpty {
+                        Task { await openBlueskyStatus(actor: actor, rkey: rkey, originalURL: url) }
+                        return .handled
+                    }
+                }
+                if comps.count >= 2 && comps[0] == "profile" {
+                    let actor = comps[1]
+                    if !actor.isEmpty { onOpenProfile?(.bluesky, actor); return .handled }
+                }
             }
         }
 
@@ -417,6 +483,27 @@ private extension PostRow {
         }
 
         return .systemAction
+    }
+
+    @MainActor
+    func openBlueskyStatus(actor: String, rkey: String, originalURL: URL?) async {
+        guard let client = session.blueskyClient else {
+            if let u = originalURL { if session.openLinksInApp { onOpenExternalURL?(u) } }
+            return
+        }
+        do {
+            if let post = try await client.fetchPost(actorOrHandle: actor, rkey: rkey) {
+                onOpenPost?(post)
+                return
+            }
+        } catch {
+            // ignore
+        }
+        if let u = originalURL {
+            if session.openLinksInApp {
+                onOpenExternalURL?(u)
+            }
+        }
     }
 
     func extractMastoStatusID(fromPath path: String) -> String? {

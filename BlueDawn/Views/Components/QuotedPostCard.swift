@@ -41,16 +41,24 @@ struct QuotedPostCard: View {
                 let thumbs = Array(post.media.prefix(2))
                 HStack(spacing: 6) {
                     ForEach(Array(thumbs.enumerated()), id: \.offset) { _, m in
-                        AsyncImage(url: m.url) { phase in
-                            switch phase {
-                            case .empty:
-                                Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
-                            case .success(let image):
-                                image.resizable().scaledToFill()
-                            case .failure:
-                                Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo").font(.caption))
-                            @unknown default:
-                                Rectangle().fill(Color.secondary.opacity(0.15))
+                        ZStack {
+                            switch m.kind {
+                            case .image:
+                                AsyncImage(url: m.url) { phase in
+                                    switch phase {
+                                    case .empty:
+                                        Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
+                                    case .success(let image):
+                                        image.resizable().scaledToFill()
+                                    case .failure:
+                                        Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo").font(.caption))
+                                    @unknown default:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                    }
+                                }
+                            case .video, .gif:
+                                Rectangle().fill(Color.secondary.opacity(0.12))
+                                    .overlay(Image(systemName: "play.fill").font(.caption).foregroundStyle(.white))
                             }
                         }
                         .frame(width: 72, height: 72)
@@ -100,6 +108,7 @@ struct QuotedPostCard: View {
             crossPostAlternates: nil,
             isCrossPostCanonical: false,
             threadPreview: nil,
+            externalURL: nil,
             quotedPost: nil
         )
     }

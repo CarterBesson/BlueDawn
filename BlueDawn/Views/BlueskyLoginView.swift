@@ -10,18 +10,24 @@ struct BlueskyLoginView: View {
         Form {
             Section("Service") {
                 TextField("Service base", text: $serviceBase)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
                     .textContentType(.URL)
                     .keyboardType(.URL)
+#endif
             }
             Section("Account") {
                 TextField("Identifier (email or handle)", text: $identifier)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+#endif
                 SecureField("App password", text: $appPassword)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+#endif
                 Button("Sign in to Bluesky") {
                     Task { await signIn() }
                 }

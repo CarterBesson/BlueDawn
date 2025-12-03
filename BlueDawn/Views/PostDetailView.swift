@@ -57,25 +57,38 @@ struct PostDetailView: View {
                                 }
                                 .buttonStyle(.plain)
 
-                                // Content → Post detail
-                                NavigationLink {
-                                    PostDetailView(post: anc, viewModel: ThreadViewModel(session: session, root: anc))
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(anc.authorDisplayName?.isEmpty == false ? anc.authorDisplayName! : anc.authorHandle)
-                                            .font(.headline.weight(.semibold))
-                                            .lineLimit(1)
-                                        Text(anc.text)
-                                            .font(.body)
-                                            .foregroundStyle(.primary)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                    }
-                                }
-                                .buttonStyle(.plain)
+                        // Content → programmatic navigation to preserve nested interactions
+                        PostRow(
+                            post: anc,
+                            showAvatar: false,
+                            onOpenProfile: { net, handle in
+                                profileRoute = ProfileRoute(network: net, handle: handle)
+                            },
+                            onOpenPost: { p in
+                                postSelection = p
+                            },
+                            onTapImage: { tappedPost, idx in
+                                imageViewer = ImageViewerState(post: tappedPost, index: idx)
+                            }
+                        )
+                        .contentShape(Rectangle())
+                        .onTapGesture { postSelection = anc }
 
                                 Spacer(minLength: 0)
                             }
                             .padding(.vertical, 10)
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                let long = session.swipeTrailingLong
+                                let short = session.swipeTrailingShort
+                                swipeButton(for: long, post: anc)
+                                swipeButton(for: short, post: anc)
+                            }
+                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                                let long = session.swipeLeadingLong
+                                let short = session.swipeLeadingShort
+                                swipeButton(for: long, post: anc)
+                                swipeButton(for: short, post: anc)
+                            }
                             Divider()
                         }
                     }
@@ -85,6 +98,9 @@ struct PostDetailView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     header
                     content
+                    if let link = externalLinkForPreview, !hasAnyMedia, post.quotedPost == nil {
+                        LinkPreviewView(url: link)
+                    }
                     if let quoted = post.quotedPost {
                         QuotedPostCard(post: quoted, onOpenPost: { q in
                             postSelection = q
@@ -92,7 +108,7 @@ struct PostDetailView: View {
                             profileRoute = ProfileRoute(network: net, handle: handle)
                         })
                     }
-                    if !post.media.isEmpty { mediaGrid }
+                    if !post.media.isEmpty { mediaCarousel }
                     actionBar
                 }
                 .id("focusedPost")
@@ -136,9 +152,18 @@ struct PostDetailView: View {
                         }
                     }
                     if host == "bsky.app" && path.hasPrefix("/profile/") {
-                        let handle = String(path.dropFirst("/profile/".count))
-                        profileRoute = ProfileRoute(network: .bluesky, handle: handle)
-                        return .handled
+                        let comps = path.split(separator: "/").map(String.init)
+                        if comps.count >= 4 && comps[0] == "profile" && comps[2] == "post" {
+                            let actor = comps[1]
+                            let rkey = comps[3]
+                            Task { await openBlueskyStatus(actor: actor, rkey: rkey, originalURL: url) }
+                            return .handled
+                        }
+                        if comps.count >= 2 && comps[0] == "profile" {
+                            let actor = comps[1]
+                            profileRoute = ProfileRoute(network: .bluesky, handle: actor)
+                            return .handled
+                        }
                     }
                     // Non-profile web links
                     if session.openLinksInApp {
@@ -242,32 +267,62 @@ struct PostDetailView: View {
     }
 
     // MARK: - Media
-    private var mediaGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)], spacing: 10) {
-            ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
-                Button {
-                    imageViewer = ImageViewerState(post: post, index: idx)
-                } label: {
-                    AsyncImage(url: m.url) { phase in
-                        switch phase {
-                        case .empty:
-                            Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
-                        case .success(let image):
-                            image.resizable().scaledToFill()
-                        case .failure:
-                            Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo"))
-                        @unknown default:
-                            Rectangle().fill(Color.secondary.opacity(0.15))
+    private var mediaCarousel: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(spacing: 12) {
+                ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
+                    Group {
+                        switch m.kind {
+                        case .image:
+                            Button { imageViewer = ImageViewerState(post: post, index: idx) } label: {
+                                AsyncImage(url: m.url) { phase in
+                                    switch phase {
+                                    case .empty:
+                                        Rectangle().fill(Color.secondary.opacity(0.1))
+                                            .overlay(ProgressView())
+                                    case .success(let image):
+                                        image.resizable().scaledToFill()
+                                    case .failure:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                            .overlay(Image(systemName: "photo").font(.title3))
+                                    @unknown default:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(m.altText ?? "Image")
+                        case .video, .gif:
+                            InlineVideoView(url: m.url)
+                                .overlay(alignment: .bottomTrailing) {
+                                    Button {
+                                        NotificationCenter.default.post(name: Notification.Name("InlineVideoPauseAll"), object: nil)
+                                        imageViewer = ImageViewerState(post: post, index: idx)
+                                    } label: {
+                                        Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .padding(6)
+                                            .background(.ultraThinMaterial, in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .padding(6)
+                                    .accessibilityLabel("Open full screen")
+                                }
+                                .accessibilityLabel(m.altText ?? "Video")
                         }
                     }
-                    .frame(height: 200)
+                    .frame(width: 280, height: 200)
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
+                    )
                 }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle())
             }
+            .scrollTargetLayout()
         }
+        .scrollTargetBehavior(.viewAligned)
+        .safeAreaPadding(.horizontal, 16)
     }
 
     // MARK: - Replies
@@ -305,23 +360,39 @@ struct PostDetailView: View {
                     }
                     .buttonStyle(.plain)
 
-                    // Content → Post detail
-                    NavigationLink {
-                        PostDetailView(post: item.post, viewModel: ThreadViewModel(session: session, root: item.post))
-                    } label: {
-                        PostRow(post: item.post, showAvatar: false, onOpenProfile: { net, handle in
+                    // Content → programmatic navigation to avoid nested link issues
+                    PostRow(
+                        post: item.post,
+                        showAvatar: false,
+                        onOpenProfile: { net, handle in
                             profileRoute = ProfileRoute(network: net, handle: handle)
-                        }, onOpenPost: { q in
+                        },
+                        onOpenPost: { q in
                             postSelection = q
-                        })
-                    }
-                    .buttonStyle(.plain)
+                        },
+                        onTapImage: { tappedPost, idx in
+                            imageViewer = ImageViewerState(post: tappedPost, index: idx)
+                        }
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture { postSelection = item.post }
 
                     Spacer(minLength: 0)
                 }
                 .padding(.leading, CGFloat(item.depth) * 16)
                 .padding(.vertical, 4)
-
+                .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                    let long = session.swipeTrailingLong
+                    let short = session.swipeTrailingShort
+                    swipeButton(for: long, post: item.post)
+                    swipeButton(for: short, post: item.post)
+                }
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    let long = session.swipeLeadingLong
+                    let short = session.swipeLeadingShort
+                    swipeButton(for: long, post: item.post)
+                    swipeButton(for: short, post: item.post)
+                }
                 Divider().padding(.leading, CGFloat(item.depth) * 16)
             }
 
@@ -356,7 +427,7 @@ struct PostDetailView: View {
         }
         .font(.title3)
         .foregroundStyle(.secondary)
-        .padding(.top, 8)
+        .padding(.top, 0)
         .buttonStyle(.plain)
     }
 
@@ -487,6 +558,36 @@ struct PostDetailView: View {
         return df.string(from: date)
     }
 
+    // First external http(s) link in the attributed text, excluding @-mentions
+    private var firstExternalLink: URL? {
+        for run in post.text.runs {
+            guard let url = run.link,
+                  let scheme = url.scheme?.lowercased(), (scheme == "http" || scheme == "https") else { continue }
+
+            // Heuristic 1: if the visible text for this run starts with '@', treat as a mention and skip
+            let range = run.range
+            let segment = post.text[range]
+            let visible = String(segment.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+            if visible.hasPrefix("@") { continue }
+
+            // Heuristic 2: skip obvious profile URL shapes
+            if let host = url.host?.lowercased() {
+                if host == "bsky.app" && url.path.lowercased().hasPrefix("/profile/") { continue }
+                if case .mastodon(let instance) = post.network, host == instance.lowercased(), url.path.hasPrefix("/@") { continue }
+            }
+
+            return url
+        }
+        return nil
+    }
+
+    // Prefer a link from the text; fall back to embedded external URL (e.g., Bluesky card)
+    private var externalLinkForPreview: URL? {
+        return firstExternalLink ?? post.externalURL
+    }
+
+    private var hasAnyMedia: Bool { !post.media.isEmpty }
+
     private func extractMastoStatusID(fromPath path: String) -> String? {
         let comps = path.split(separator: "/").map(String.init)
         if comps.count >= 2, comps[0].hasPrefix("@") {
@@ -514,5 +615,163 @@ struct PostDetailView: View {
         #if canImport(SafariServices) && canImport(UIKit)
         if session.openLinksInApp { safariURL = originalURL }
         #endif
+    }
+
+    @MainActor
+    private func openBlueskyStatus(actor: String, rkey: String, originalURL: URL?) async {
+        guard let client = session.blueskyClient else {
+            #if canImport(SafariServices) && canImport(UIKit)
+            if session.openLinksInApp { safariURL = originalURL }
+            #endif
+            return
+        }
+        if let post = try? await client.fetchPost(actorOrHandle: actor, rkey: rkey) {
+            postSelection = post
+            return
+        }
+        #if canImport(SafariServices) && canImport(UIKit)
+        if session.openLinksInApp { safariURL = originalURL }
+        #endif
+    }
+}
+
+// MARK: - Swipe actions for ancestor/reply rows
+private extension PostDetailView {
+    @ViewBuilder
+    func swipeButton(for action: SessionStore.SwipeAction, post p: UnifiedPost) -> some View {
+        switch action {
+        case .none:
+            EmptyView()
+        case .reply:
+            Button {
+                Haptics.impact(.light)
+                postSelection = p
+            } label: { Label(action.label, systemImage: action.systemImage) }
+            .tint(.blue)
+        case .like:
+            Button { Task { await toggleLike(for: p) } } label: { Label(labelForLike(p), systemImage: symbolForLike(p)) }
+            .tint(.pink)
+        case .repost:
+            Button { Task { await toggleRepost(for: p) } } label: { Label(labelForRepost(p), systemImage: "arrow.2.squarepath") }
+            .tint(.green)
+        case .bookmark:
+            if case .mastodon = p.network {
+                Button { Task { await toggleBookmark(for: p) } } label: { Label(labelForBookmark(p), systemImage: symbolForBookmark(p)) }
+                .tint(.yellow)
+            } else {
+                EmptyView()
+            }
+        }
+    }
+
+    private func labelForLike(_ p: UnifiedPost) -> String { session.state(for: p).isLiked ? "Unlike" : "Like" }
+    private func symbolForLike(_ p: UnifiedPost) -> String { session.state(for: p).isLiked ? "heart.fill" : "heart" }
+    private func labelForRepost(_ p: UnifiedPost) -> String { session.state(for: p).isReposted ? "Undo Repost" : "Repost" }
+    private func labelForBookmark(_ p: UnifiedPost) -> String { session.state(for: p).isBookmarked ? "Remove" : "Bookmark" }
+    private func symbolForBookmark(_ p: UnifiedPost) -> String { session.state(for: p).isBookmarked ? "bookmark.fill" : "bookmark" }
+
+    @MainActor
+    func toggleLike(for p: UnifiedPost) async {
+        let s = session.state(for: p)
+        let prevLiked = s.isLiked
+        let prevCount = s.likeCount
+        let prevRkey = s.bskyLikeRkey
+        if s.isLiked {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: p.id) { $0.isLiked = false; $0.likeCount = max(0, prevCount - 1) } }
+            switch p.network {
+            case .bluesky:
+                do { try await session.blueskyClient?.unlike(post: p, rkey: prevRkey) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+                }
+            case .mastodon:
+                do { try await session.mastodonClient?.unlike(post: p, rkey: nil) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+                }
+            }
+            return
+        }
+        Haptics.impact(.light)
+        withAnimation { session.updateState(for: p.id) { $0.isLiked = true; $0.likeCount = prevCount + 1 } }
+        switch p.network {
+        case .bluesky:
+            do {
+                let rkey = try await session.blueskyClient?.like(post: p)
+                withAnimation { session.updateState(for: p.id) { $0.bskyLikeRkey = rkey ?? prevRkey } }
+            } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+            }
+        case .mastodon:
+            do { _ = try await session.mastodonClient?.like(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isLiked = prevLiked; $0.likeCount = prevCount } }
+            }
+        }
+    }
+
+    @MainActor
+    func toggleRepost(for p: UnifiedPost) async {
+        let s = session.state(for: p)
+        let prev = s.isReposted
+        let prevCount = s.repostCount
+        let prevRkey = s.bskyRepostRkey
+        if s.isReposted {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: p.id) { $0.isReposted = false; $0.repostCount = max(0, prevCount - 1) } }
+            switch p.network {
+            case .bluesky:
+                do { try await session.blueskyClient?.unrepost(post: p, rkey: prevRkey) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+                }
+            case .mastodon:
+                do { try await session.mastodonClient?.unrepost(post: p, rkey: nil) } catch {
+                    Haptics.notify(.error)
+                    withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+                }
+            }
+            return
+        }
+        Haptics.impact(.light)
+        withAnimation { session.updateState(for: p.id) { $0.isReposted = true; $0.repostCount = prevCount + 1 } }
+        switch p.network {
+        case .bluesky:
+            do {
+                let rkey = try await session.blueskyClient?.repost(post: p)
+                withAnimation { session.updateState(for: p.id) { $0.bskyRepostRkey = rkey ?? prevRkey } }
+            } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+            }
+        case .mastodon:
+            do { _ = try await session.mastodonClient?.repost(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isReposted = prev; $0.repostCount = prevCount } }
+            }
+        }
+    }
+
+    @MainActor
+    func toggleBookmark(for p: UnifiedPost) async {
+        guard case .mastodon = p.network else { return }
+        let prev = session.state(for: p).isBookmarked
+        if prev {
+            Haptics.impact(.rigid)
+            withAnimation { session.updateState(for: p.id) { $0.isBookmarked = false } }
+            do { try await session.mastodonClient?.unbookmark(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isBookmarked = prev } }
+            }
+        } else {
+            Haptics.impact(.light)
+            withAnimation { session.updateState(for: p.id) { $0.isBookmarked = true } }
+            do { try await session.mastodonClient?.bookmark(post: p) } catch {
+                Haptics.notify(.error)
+                withAnimation { session.updateState(for: p.id) { $0.isBookmarked = prev } }
+            }
+        }
     }
 }

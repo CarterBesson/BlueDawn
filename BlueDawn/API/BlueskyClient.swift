@@ -13,7 +13,7 @@ struct BlueskyClient: SocialClient {
         comps?.queryItems = items
 
         guard let url = comps?.url else { throw URLError(.badURL) }
-        // Load the authed user's DID and their following DIDs so we can filter replies reliably
+        // Load authed user's DID and follow set for reply filtering
         struct Session: Decodable { let did: String; let handle: String }
         func getSession() async throws -> Session {
             var sComps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
@@ -53,11 +53,13 @@ struct BlueskyClient: SocialClient {
         let mapped = tl.feed.compactMap { feedItem -> UnifiedPost? in
             let p = feedItem.post
             guard let rec = p.record, rec.type == "app.bsky.feed.post" else { return nil }
-            // Exclude replies unless they are to authors I follow
-            if let r = p.reply, let parentAuthor = r.parent?.author {
+            if let reply = feedItem.reply, let parentAuthor = reply.parent?.author {
                 let followedViaViewer = (parentAuthor.viewer?.following != nil)
                 let followedViaSet = followingDIDs.contains(parentAuthor.did)
                 if !(followedViaViewer || followedViaSet) { return nil }
+            } else if feedItem.reply != nil {
+                // Reply context present but no parent author → drop it
+                return nil
             }
             let isRepost = (feedItem.reason?.type == "app.bsky.feed.defs#reasonRepost")
             let boostedHandle = isRepost ? feedItem.reason?.by?.handle : nil
@@ -121,6 +123,37 @@ struct BlueskyClient: SocialClient {
             }
         }
         return stack.reversed()
+    }
+
+    // MARK: - Fetch a single post by actor/rkey (from bsky.app link)
+    func fetchPost(actorOrHandle actor: String, rkey: String) async throws -> UnifiedPost? {
+        // Resolve handle to DID if needed
+        let did = try await resolveDID(for: actor)
+        var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/xrpc/app.bsky.feed.getPostThread"
+        let atUri = "at://\(did)/app.bsky.feed.post/\(rkey)"
+        comps?.queryItems = [URLQueryItem(name: "uri", value: atUri)]
+        guard let url = comps?.url else { throw URLError(.badURL) }
+
+        let data = try await performGET(url)
+        let decoder = JSONDecoder()
+        let resp = try decoder.decode(GetPostThreadResponse.self, from: data)
+        if case let .threadViewPost(node) = resp.thread {
+            return mapPostToUnified(node.post)
+        }
+        return nil
+    }
+
+    private func resolveDID(for actorOrDid: String) async throws -> String {
+        if actorOrDid.hasPrefix("did:") { return actorOrDid }
+        var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/xrpc/com.atproto.identity.resolveHandle"
+        comps?.queryItems = [URLQueryItem(name: "handle", value: actorOrDid)]
+        guard let url = comps?.url else { throw URLError(.badURL) }
+        struct Resp: Decodable { let did: String }
+        let data = try await performGET(url)
+        let r = try JSONDecoder().decode(Resp.self, from: data)
+        return r.did
     }
 
     // MARK: - Profile
@@ -467,6 +500,7 @@ struct BlueskyClient: SocialClient {
         let text = attributedFromBsky(text: p.record?.text ?? "", facets: p.record?.facets)
         var media: [Media] = []
         var quoted: QuotedPost? = nil
+        var externalURL: URL? = nil
         if let embed = p.embed {
             switch embed {
             case .images(let view):
@@ -474,16 +508,32 @@ struct BlueskyClient: SocialClient {
                     guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
                     return Media(url: url, altText: img.alt, kind: .image)
                 }
+            case .video(let view):
+                if let videoMedia = mediaFromVideo(view) {
+                    media = [videoMedia]
+                }
             case .record(let rv):
                 if case .view(let r) = rv.record { quoted = mapEmbeddedRecordToQuoted(r) }
             case .recordWithMedia(let rwm):
-                if case .view(let r) = rwm.record { quoted = mapEmbeddedRecordToQuoted(r) }
-                if let m = rwm.media, case .images(let view) = m {
-                    media = view.images.compactMap { img in
-                        guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
-                        return Media(url: url, altText: img.alt, kind: .image)
+                if case .view(let r) = rwm.record {
+                    var quotedMedia: [Media] = []
+                    if let m = rwm.media {
+                        switch m {
+                        case .images(let view):
+                            quotedMedia = view.images.compactMap { img in
+                                guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
+                                return Media(url: url, altText: img.alt, kind: .image)
+                            }
+                        case .video(let view):
+                            if let vm = mediaFromVideo(view) { quotedMedia = [vm] }
+                        default:
+                            break
+                        }
                     }
+                    quoted = mapEmbeddedRecordToQuoted(r, media: quotedMedia)
                 }
+            case .external(let extView):
+                externalURL = URL(string: extView.external.uri)
             case .unsupported:
                 break
             }
@@ -523,6 +573,7 @@ struct BlueskyClient: SocialClient {
             isBookmarked: false,
             boostedByHandle: boostedByHandle,
             boostedByDisplayName: boostedByDisplayName,
+            externalURL: externalURL,
             quotedPost: quoted
         )
     }
@@ -574,7 +625,19 @@ struct BlueskyClient: SocialClient {
 
     private struct FeedViewPost: Decodable {
         let post: Post
+        let reply: ReplyRef?
         let reason: Reason?
+    }
+
+    private struct ReplyRef: Decodable {
+        let root: ReplyPost?
+        let parent: ReplyPost?
+    }
+
+    private struct ReplyPost: Decodable {
+        let uri: String?
+        let cid: String?
+        let author: Author?
     }
 
     private struct Reason: Decodable {
@@ -705,8 +768,10 @@ struct BlueskyClient: SocialClient {
 
     private enum Embed: Decodable {
         case images(ImagesView)
+        case video(VideoView)
         case record(RecordView)
         indirect case recordWithMedia(RecordWithMediaView)
+        case external(ExternalView)
         case unsupported
 
         init(from decoder: Decoder) throws {
@@ -715,10 +780,14 @@ struct BlueskyClient: SocialClient {
             switch type {
             case "app.bsky.embed.images#view":
                 self = .images(try ImagesView(from: decoder))
+            case "app.bsky.embed.video#view":
+                self = .video(try VideoView(from: decoder))
             case "app.bsky.embed.record#view":
                 self = .record(try RecordView(from: decoder))
             case "app.bsky.embed.recordWithMedia#view":
                 self = .recordWithMedia(try RecordWithMediaView(from: decoder))
+            case "app.bsky.embed.external#view":
+                self = .external(try ExternalView(from: decoder))
             default:
                 self = .unsupported
             }
@@ -728,6 +797,18 @@ struct BlueskyClient: SocialClient {
     private struct RecordView: Decodable {
         let record: EmbeddedRecord
         enum CodingKeys: String, CodingKey { case record }
+    }
+
+    private struct ExternalView: Decodable {
+        let external: External
+        enum CodingKeys: String, CodingKey { case external }
+
+        struct External: Decodable {
+            let uri: String
+            let title: String
+            let description: String
+            let thumb: String?
+        }
     }
 
     private struct RecordWithMediaView: Decodable {
@@ -762,6 +843,7 @@ struct BlueskyClient: SocialClient {
         let cid: String
         let author: Author
         let value: RecordValue?
+        let embeds: [Embed]?
     }
 
     private struct RecordValue: Decodable {
@@ -770,9 +852,35 @@ struct BlueskyClient: SocialClient {
         let facets: [Facet]?
     }
 
-    private func mapEmbeddedRecordToQuoted(_ r: ViewRecord) -> QuotedPost {
+    private func mediaFromVideo(_ video: VideoView) -> Media? {
+        guard let playlist = video.playlist, let url = URL(string: playlist) else { return nil }
+        let kind: Media.Kind = (video.isGif ?? false) ? .gif : .video
+        return Media(url: url, altText: video.alt, kind: kind)
+    }
+
+    private func mapEmbeddedRecordToQuoted(_ r: ViewRecord, media: [Media] = []) -> QuotedPost {
         let created = parseISO8601(r.value?.createdAt ?? "") ?? Date()
         let text = attributedFromBsky(text: r.value?.text ?? "", facets: r.value?.facets)
+
+        // Extract media from the quoted post's own embeds
+        var quotedMedia = media
+        if let embeds = r.embeds {
+            for embed in embeds {
+                switch embed {
+                case .images(let view):
+                    let embedMedia: [Media] = view.images.compactMap { img in
+                        guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
+                        return Media(url: url, altText: img.alt, kind: .image)
+                    }
+                    quotedMedia.append(contentsOf: embedMedia)
+                case .video(let view):
+                    if let vm = mediaFromVideo(view) { quotedMedia.append(vm) }
+                default:
+                    break
+                }
+            }
+        }
+
         return QuotedPost(
             id: "bsky:\(r.uri)",
             network: .bluesky,
@@ -781,7 +889,7 @@ struct BlueskyClient: SocialClient {
             authorAvatarURL: URL(string: r.author.avatar ?? ""),
             createdAt: created,
             text: text,
-            media: []
+            media: quotedMedia
         )
     }
 
@@ -791,6 +899,20 @@ struct BlueskyClient: SocialClient {
             let thumb: String?
             let fullsize: String?
             let alt: String?
+        }
+    }
+
+    private struct VideoView: Decodable {
+        let cid: String?
+        let playlist: String?
+        let thumbnail: String?
+        let alt: String?
+        let aspectRatio: AspectRatio?
+        let isGif: Bool?
+
+        struct AspectRatio: Decodable {
+            let width: Int?
+            let height: Int?
         }
     }
 

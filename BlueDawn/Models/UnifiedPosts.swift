@@ -56,6 +56,7 @@ struct UnifiedPost: Identifiable, Codable {
     var crossPostAlternates: [Network: String]? = nil
     var isCrossPostCanonical: Bool = false
     var threadPreview: ThreadPreview? = nil // Set when this is the root of a thread to display
+    var externalURL: URL? = nil // Embedded external link previews (e.g., Bluesky cards)
     // Quoted/embedded post (Bluesky record embed, Mastodon quote)
     var quotedPost: QuotedPost? = nil
 }
@@ -69,6 +70,7 @@ extension UnifiedPost {
         case isLiked, isReposted, isBookmarked
         case boostedByHandle, boostedByDisplayName
         case crossPostAlternates, isCrossPostCanonical, threadPreview
+        case externalURL
         case quotedPost
     }
 
@@ -97,6 +99,7 @@ extension UnifiedPost {
         crossPostAlternates = try c.decodeIfPresent([Network: String].self, forKey: .crossPostAlternates)
         isCrossPostCanonical = try c.decodeIfPresent(Bool.self, forKey: .isCrossPostCanonical) ?? false
         threadPreview = try c.decodeIfPresent(ThreadPreview.self, forKey: .threadPreview)
+        externalURL = try c.decodeIfPresent(URL.self, forKey: .externalURL)
         quotedPost = try c.decodeIfPresent(QuotedPost.self, forKey: .quotedPost)
     }
 
@@ -125,6 +128,7 @@ extension UnifiedPost {
         try c.encodeIfPresent(crossPostAlternates, forKey: .crossPostAlternates)
         try c.encode(isCrossPostCanonical, forKey: .isCrossPostCanonical)
         try c.encodeIfPresent(threadPreview, forKey: .threadPreview)
+        try c.encodeIfPresent(externalURL, forKey: .externalURL)
         try c.encodeIfPresent(quotedPost, forKey: .quotedPost)
     }
 }
