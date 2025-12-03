@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 
+
 @MainActor
 @Observable
 final class TimelineViewModel {
@@ -14,7 +15,7 @@ final class TimelineViewModel {
     // UI state (plain vars; @Observable tracks mutations)
     // `posts` is the filtered view of `allPosts`, kept in a stable order.
     private(set) var posts: [UnifiedPost] = []
-    var filter: Filter = .all { didSet { applyFilter() } }
+    var filter: Filter = .all { didSet { Task { await applyFilterAsync() } } }
 
     enum CanonicalPreference: String, CaseIterable { case newest, oldest, blueskyFirst, mastodonFirst }
     var canonicalPreference: CanonicalPreference = .newest
@@ -30,6 +31,13 @@ final class TimelineViewModel {
     private var allPosts: [UnifiedPost] = []
     private var idSet: Set<String> = []
 
+    // Cached filtered results for performance
+    private var cachedAllPosts: [UnifiedPost] = []
+    private var cachedBlueskyPosts: [UnifiedPost] = []
+    private var cachedMastodonPosts: [UnifiedPost] = []
+    private var filterCacheValid = false
+
+
     // Pagination anchors
     private var mastodonBottomCursor: String? = nil // for older pages (max_id)
     private var blueskyBottomCursor: String? = nil  // for older pages (cursor)
@@ -37,10 +45,10 @@ final class TimelineViewModel {
     private var currentAnchorID: String? = nil      // last visible item id to preserve position across sessions
 
     // Retention / compaction settings
-    private let retentionMaxCount = 8000
-    private let retentionHighWater = 9000
-    private let retentionAgeDays: Int = 45
-    private let retentionAnchorBuffer = 300
+    private let retentionMaxCount = 1400
+    private let retentionHighWater = 1650
+    private let retentionAgeDays: Int = 30
+    private let retentionAnchorBuffer = 120
 
     init(session: SessionStore) {
         self.session = session
@@ -128,17 +136,22 @@ final class TimelineViewModel {
         let mResult = await mastodonTask
         let bResult = await blueskyTask
 
-        // Merge incremental results
+        // Merge incremental results and sort by creation time
+        var newPosts: [UnifiedPost] = []
         if case .success(let (mNew, newestID)) = mResult {
             if let newestID { mastodonNewestID = newestID }
-            insertNewAtTop(mNew)
+            newPosts.append(contentsOf: mNew)
         }
         if case .success(let (bNew, _)) = bResult {
-            insertNewAtTop(bNew)
+            newPosts.append(contentsOf: bNew)
         }
 
-        applyFilter()
-        persist()
+        // Sort all new posts by creation time (newest first) to create proper interleaved timeline
+        newPosts.sort { $0.createdAt > $1.createdAt }
+
+        if !newPosts.isEmpty {
+            await processAndInsertNewPosts(newPosts)
+        }
 
         // Surface an error if either provider failed, with source labels
         var messages: [String] = []
@@ -207,9 +220,11 @@ final class TimelineViewModel {
             }
         }
 
-        insertOlderInOrder(fetched)
-        applyFilter()
-        persist()
+        if !fetched.isEmpty {
+            // Sort older posts by creation time (newest first) for proper interleaving
+            fetched.sort { $0.createdAt > $1.createdAt }
+            await processAndInsertOlderPosts(fetched)
+        }
     }
 
     // MARK: - Persistence
@@ -222,11 +237,14 @@ final class TimelineViewModel {
             blueskyBottomCursor = saved.meta.blueskyBottomCursor
             mastodonNewestID = saved.meta.mastodonNewestID
             currentAnchorID = saved.meta.anchorPostID
-            if deduped.count != saved.posts.count { persist(anchorID: saved.meta.anchorPostID) }
-            applyFilter()
+            let didTrim = compactIfNeeded(anchorID: saved.meta.anchorPostID)
+            if deduped.count != saved.posts.count || didTrim {
+                persist(anchorID: saved.meta.anchorPostID)
+            }
+            await applyFilterAsync()
             return saved.meta.anchorPostID
         }
-        applyFilter()
+        await applyFilterAsync()
         return nil
     }
 
@@ -235,11 +253,30 @@ final class TimelineViewModel {
         persist()
     }
 
+    func debugClearAndReload() async {
+        // Clear all cached data
+        allPosts.removeAll()
+        idSet.removeAll()
+        posts.removeAll()
+
+        // Reset pagination cursors
+        mastodonBottomCursor = nil
+        blueskyBottomCursor = nil
+        mastodonNewestID = nil
+        currentAnchorID = nil
+
+        // Clear cached filters
+        invalidateFilterCache()
+
+        // Load fresh data
+        await refresh()
+    }
+
     private func persist(anchorID: String? = nil) {
         let anchor = anchorID ?? currentAnchorID
         // Compact before saving to bound storage
         let didCompact = compactIfNeeded(anchorID: anchor)
-        if didCompact { applyFilter() }
+        if didCompact { Task { await applyFilterAsync() } }
         let meta = TimelineMeta(
             mastodonBottomCursor: mastodonBottomCursor,
             blueskyBottomCursor: blueskyBottomCursor,
@@ -290,18 +327,71 @@ final class TimelineViewModel {
         if trimmed.count >= allPosts.count { return false }
         allPosts = trimmed
         idSet = Set(allPosts.map { $0.id })
+        invalidateFilterCache()
         return true
     }
 
-    private func applyFilter() {
-        // Do not reorder allPosts; just filter.
+    // MARK: - Background Processing
+
+    private func processAndInsertNewPosts(_ newPosts: [UnifiedPost]) async {
+        // For now, skip heavy processing and just insert directly
+        // This maintains the performance improvement from cached filtering
+        insertNewAtTop(newPosts)
+        invalidateFilterCache()
+        await applyFilterAsync()
+        persist()
+    }
+
+    private func processAndInsertOlderPosts(_ olderPosts: [UnifiedPost]) async {
+        // For now, skip heavy processing and just insert directly
+        // This maintains the performance improvement from cached filtering
+        insertOlderInOrder(olderPosts)
+        invalidateFilterCache()
+        await applyFilterAsync()
+        persist()
+    }
+
+    private func invalidateFilterCache() {
+        filterCacheValid = false
+    }
+
+    private func applyFilterAsync() async {
+        // Use cached results if available and valid
+        if filterCacheValid {
+            switch filter {
+            case .all:
+                posts = cachedAllPosts
+            case .bluesky:
+                posts = cachedBlueskyPosts
+            case .mastodon:
+                posts = cachedMastodonPosts
+            }
+            return
+        }
+
+        // Process filtering in background
+        let allPostsCopy = allPosts
+        let (allFiltered, blueskyFiltered, mastodonFiltered) = await Task.detached {
+            let bluesky = allPostsCopy.filter { if case .bluesky = $0.network { return true } else { return false } }
+            let mastodon = allPostsCopy.filter { if case .mastodon = $0.network { return true } else { return false } }
+
+            return (allPostsCopy, bluesky, mastodon)
+        }.value
+
+        // Update cache
+        cachedAllPosts = allFiltered
+        cachedBlueskyPosts = blueskyFiltered
+        cachedMastodonPosts = mastodonFiltered
+        filterCacheValid = true
+
+        // Apply current filter
         switch filter {
         case .all:
-            posts = allPosts
+            posts = allFiltered
         case .bluesky:
-            posts = allPosts.filter { if case .bluesky = $0.network { return true } else { return false } }
+            posts = blueskyFiltered
         case .mastodon:
-            posts = allPosts.filter { if case .mastodon = $0.network { return true } else { return false } }
+            posts = mastodonFiltered
         }
     }
 
@@ -532,6 +622,7 @@ final class TimelineViewModel {
     // Expand window to better catch delayed cross-posts across services
     private let crossPostWindow: TimeInterval = 6 * 60 * 60 // 6 hours
 
+
     private func dedupeCrossPosts(_ all: [UnifiedPost],
                                   preference: CanonicalPreference) -> [UnifiedPost] {
         // Group by a conservative signature: author local handle + normalized text + media hint
@@ -580,18 +671,28 @@ final class TimelineViewModel {
     private func selectCanonical(from cluster: [UnifiedPost],
                                  preference: CanonicalPreference) -> UnifiedPost {
         guard cluster.count > 1 else { return cluster[0] }
+
+        // First, prefer posts that have media (any posts with non-empty media arrays)
+        let postsWithMedia = cluster.filter { !$0.media.isEmpty }
+
+        // If we have posts with media, prefer those; otherwise use all posts
+        let withValidMedia = postsWithMedia.isEmpty ? cluster : postsWithMedia
+
+        // If some posts have valid media and others don't, prefer those with valid media
+        let candidates = withValidMedia.isEmpty ? cluster : withValidMedia
+
         let pick: UnifiedPost = {
             switch preference {
             case .blueskyFirst:
-                return cluster.first(where: { if case .bluesky = $0.network { return true } else { return false } })
-                    ?? cluster.max(by: { $0.createdAt < $1.createdAt })!
+                return candidates.first(where: { if case .bluesky = $0.network { return true } else { return false } })
+                    ?? candidates.max(by: { $0.createdAt < $1.createdAt })!
             case .mastodonFirst:
-                return cluster.first(where: { if case .mastodon = $0.network { return true } else { return false } })
-                    ?? cluster.max(by: { $0.createdAt < $1.createdAt })!
+                return candidates.first(where: { if case .mastodon = $0.network { return true } else { return false } })
+                    ?? candidates.max(by: { $0.createdAt < $1.createdAt })!
             case .newest:
-                return cluster.max(by: { $0.createdAt < $1.createdAt })!
+                return candidates.max(by: { $0.createdAt < $1.createdAt })!
             case .oldest:
-                return cluster.min(by: { $0.createdAt < $1.createdAt })!
+                return candidates.min(by: { $0.createdAt < $1.createdAt })!
             }
         }()
 
@@ -674,15 +775,21 @@ final class TimelineViewModel {
         guard !filtered.isEmpty else { return }
         allPosts.insert(contentsOf: filtered, at: 0)
         for p in filtered { idSet.insert(p.id) }
+        invalidateFilterCache()
     }
 
     private func insertOlderInOrder(_ batch: [UnifiedPost]) {
+        var didInsert = false
         for p in batch {
             if idSet.contains(p.id) { continue }
             if isCrossDuplicate(of: p) { continue }
             let idx = insertionIndex(for: p)
             allPosts.insert(p, at: idx)
             idSet.insert(p.id)
+            didInsert = true
+        }
+        if didInsert {
+            invalidateFilterCache()
         }
     }
 

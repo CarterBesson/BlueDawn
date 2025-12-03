@@ -10,8 +10,10 @@ struct SearchView: View {
                 HStack {
                     Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
                     TextField("Search…", text: $query)
-                        .textInputAutocapitalization(.never)
+#if canImport(UIKit)
+                        .autocapitalization(.none)
                         .disableAutocorrection(true)
+#endif
                 }
                 .padding(12)
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.secondary.opacity(0.08)))
@@ -40,4 +42,3 @@ struct SearchView: View {
         }
     }
 }
-

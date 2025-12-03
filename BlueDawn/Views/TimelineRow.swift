@@ -38,9 +38,9 @@ struct TimelineRow: View {
                 onOpenExternalURL: onOpenExternalURL,
                 compactPadding: true
             )
-            .contentShape(Rectangle())
-            .onTapGesture { onOpenPost(post) }
         }
+        .contentShape(Rectangle())
+        .onTapGesture { onOpenPost(post) }
         .padding(.vertical, 10)
         .padding(.horizontal, 12)
         .background(backgroundTint)

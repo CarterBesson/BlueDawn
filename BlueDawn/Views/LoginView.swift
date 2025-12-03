@@ -7,7 +7,9 @@ struct LoginView: View {
     @State private var bskyIdentifier: String = ""   // email or handle (e.g., you.bsky.social)
     @State private var bskyAppPassword: String = ""  // app password from Bluesky settings
     @State private var bskyService: String = "https://bsky.social" // optional PDS/service base
-    
+
+    private var fieldBackground: Color { Color.secondary.opacity(0.12) }
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 24) {
@@ -19,18 +21,22 @@ struct LoginView: View {
                     Label("Mastodon", systemImage: "dot.radiowaves.left.and.right")
                         .font(.headline)
                     TextField("Your instance (e.g. mastodon.social)", text: $instanceDomain)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
+#if canImport(UIKit)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
                         .textContentType(.URL)
                         .keyboardType(.URL)
+#endif
                         .padding(12)
-                        .background(.ultraThinMaterial)
+                        .background(fieldBackground)
                         .cornerRadius(12)
                     SecureField("Personal access token (temporary)", text: $mastodonToken)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+#endif
                         .padding(12)
-                        .background(.ultraThinMaterial)
+                        .background(fieldBackground)
                         .cornerRadius(12)
                     Button {
                         Task { await signInMastodon() }
@@ -45,26 +51,32 @@ struct LoginView: View {
                     Label("Bluesky", systemImage: "cloud")
                         .font(.headline)
                     TextField("Identifier (email or handle)", text: $bskyIdentifier)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+#endif
                         .padding(12)
-                        .background(.ultraThinMaterial)
+                        .background(fieldBackground)
                         .cornerRadius(12)
 
                     SecureField("App password", text: $bskyAppPassword)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+#endif
                         .padding(12)
-                        .background(.ultraThinMaterial)
+                        .background(fieldBackground)
                         .cornerRadius(12)
 
                     TextField("Service base (optional)", text: $bskyService)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
+                        .padding(12)
+#if canImport(UIKit)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
                         .textContentType(.URL)
                         .keyboardType(.URL)
-                        .padding(12)
-                        .background(.ultraThinMaterial)
+#endif
+                        .background(fieldBackground)
                         .cornerRadius(12)
                     Button {
                         Task { await signInBluesky() }

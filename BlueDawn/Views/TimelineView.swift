@@ -16,6 +16,7 @@ struct HomeTimelineView: View {
     @State private var anchorID: String? = nil
     @State private var pendingScrollToID: String? = nil
     @State private var jumpInProgress = false
+    @State private var suppressAnchorUpdates = false
     @State private var imageViewer: ImageViewerState? = nil
     @State private var postSelection: UnifiedPost? = nil
     @State private var safariURL: URL? = nil
@@ -48,6 +49,8 @@ struct HomeTimelineView: View {
             anchorID: $anchorID,
             pendingScrollToID: $pendingScrollToID,
             jumpInProgress: $jumpInProgress,
+            suppressAnchorUpdates: $suppressAnchorUpdates,
+            didInitialRestore: didInitialRestore,
             onOpenProfile: { network, handle in
                 profileRoute = ProfileRoute(network: network, handle: handle)
             },
@@ -89,8 +92,30 @@ struct HomeTimelineView: View {
         .navigationDestination(item: $postSelection) { post in
             PostDetailView(post: post, viewModel: ThreadViewModel(session: session, root: post))
         }
+        .onChange(of: postSelection) { _, newValue in
+            if newValue != nil {
+                // Suppress anchor updates when navigating to a post
+                suppressAnchorUpdates = true
+            } else {
+                // Re-enable anchor updates after a delay when returning from post detail
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    suppressAnchorUpdates = false
+                }
+            }
+        }
         .navigationDestination(item: $profileRoute) { route in
             ProfileView(network: route.network, handle: route.handle, session: session)
+        }
+        .onChange(of: profileRoute) { _, newValue in
+            if newValue != nil {
+                // Suppress anchor updates when navigating to a profile
+                suppressAnchorUpdates = true
+            } else {
+                // Re-enable anchor updates after a delay when returning from profile
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    suppressAnchorUpdates = false
+                }
+            }
         }
         .overlay(alignment: .topTrailing) {
             if aboveCount > 0 {
@@ -157,6 +182,10 @@ struct HomeTimelineView: View {
                     NavigationLink(destination: SettingsView()) {
                         Label("Settings", systemImage: "gearshape")
                     }
+                    Divider()
+                    Button("🔄 Force Refresh Timeline") {
+                        Task { await viewModel.debugClearAndReload() }
+                    }
                 } label: {
                     AvatarCircle(
                         handle: session.selectedHandle ?? "?",
@@ -171,18 +200,23 @@ struct HomeTimelineView: View {
             MyProfilesView()
         }
         .task {
+            // Only run restoration logic if we haven't done initial restore yet
+            guard !didInitialRestore else { return }
+
             let restoredAnchor = await viewModel.loadPersisted()
             if let anchor = restoredAnchor {
-                // Apply anchor immediately and schedule an explicit jump once rows exist
+                // Apply anchor immediately and trigger instant scroll
                 anchorID = anchor
                 DispatchQueue.main.async { pendingScrollToID = anchor }
+                // Mark restore complete after scroll settles
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    didInitialRestore = true
+                }
+            } else {
+                // No anchor to restore, fetch fresh content
+                await viewModel.refresh()
+                didInitialRestore = true
             }
-            // Fetch new items (if any) without disturbing position
-            await viewModel.refresh()
-            // Reassert anchor after refresh to avoid drift
-            if let anchor = restoredAnchor { anchorID = anchor }
-            // Mark restore complete after any jump animation settles
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { didInitialRestore = true }
         }
         .onChange(of: viewModel.filter) { _, _ in
             // When switching filters, jump to top of the new dataset
@@ -197,6 +231,7 @@ struct HomeTimelineView: View {
             withAnimation { toastText = msg }
         }
     }
+
 }
 
 struct TimelineList: View {
@@ -208,15 +243,20 @@ struct TimelineList: View {
     @Binding var anchorID: String?
     @Binding var pendingScrollToID: String?
     @Binding var jumpInProgress: Bool
+    @Binding var suppressAnchorUpdates: Bool
+    let didInitialRestore: Bool
     let onOpenProfile: (Network, String) -> Void
     let onTapImage: (UnifiedPost, Int) -> Void
     let onOpenExternalURL: (URL) -> Void
     let onRefresh: () async -> Void
 
+    @State private var visibleTracker = VisibleRangeTracker()
+
     var body: some View {
         ScrollViewReader { proxy in
             List {
-                ForEach(Array(posts.enumerated()), id: \.element.id) { index, post in
+                ForEach(posts.indices, id: \.self) { index in
+                    let post = posts[index]
                     TimelineRow(
                         post: post,
                         session: session,
@@ -228,6 +268,10 @@ struct TimelineList: View {
                     .id(post.id)
                     .onAppear {
                         onItemAppear(index)
+                        applyAnchorCandidate(visibleTracker.appeared(id: post.id, index: index))
+                    }
+                    .onDisappear {
+                        applyAnchorCandidate(visibleTracker.disappeared(id: post.id))
                     }
                 }
 
@@ -240,16 +284,101 @@ struct TimelineList: View {
             .listStyle(.plain)
             .listRowSpacing(0)
             .scrollIndicators(.automatic)
+            .applyScrollTargetLayoutIfAvailable()
             .refreshable { await onRefresh() }
-            .scrollPosition(id: $anchorID, anchor: .top)
+            .scrollPosition(id: $anchorID)
             .transaction { if !jumpInProgress { $0.animation = nil } }
             .onChange(of: pendingScrollToID) { _, new in
                 guard let id = new else { return }
                 jumpInProgress = true
-                withAnimation(.snappy) { proxy.scrollTo(id, anchor: .top) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { jumpInProgress = false }
+
+                // Use instant scroll for initial restore, animated for user interactions
+                if didInitialRestore {
+                    withAnimation(.snappy) { proxy.scrollTo(id, anchor: .top) }
+                } else {
+                    // Instant scroll for initial restore
+                    proxy.scrollTo(id, anchor: .top)
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    jumpInProgress = false
+                    applyAnchorCandidate(visibleTracker.currentAnchorID())
+                }
                 pendingScrollToID = nil
             }
+            .onChange(of: posts.count) { _, _ in
+                visibleTracker.prune(validIDs: posts.map { $0.id })
+                applyAnchorCandidate(visibleTracker.currentAnchorID())
+            }
+            .onChange(of: jumpInProgress) { _, newValue in
+                if !newValue {
+                    applyAnchorCandidate(visibleTracker.currentAnchorID())
+                }
+            }
         }
+    }
+}
+
+private struct ScrollTargetLayoutSupport: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content.scrollTargetLayout()
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func applyScrollTargetLayoutIfAvailable() -> some View {
+        modifier(ScrollTargetLayoutSupport())
+    }
+}
+
+private struct VisibleRangeTracker {
+    private var indexByID: [String: Int] = [:]
+
+    mutating func appeared(id: String, index: Int) -> String? {
+        indexByID[id] = index
+        return currentAnchorID()
+    }
+
+    mutating func disappeared(id: String) -> String? {
+        indexByID.removeValue(forKey: id)
+        return currentAnchorID()
+    }
+
+    mutating func prune(validIDs: [String]) {
+        guard !indexByID.isEmpty else { return }
+        let allowed = Set(validIDs)
+        indexByID = Dictionary(uniqueKeysWithValues: indexByID.lazy.filter { allowed.contains($0.key) })
+    }
+
+    func currentAnchorID() -> String? {
+        // Choose the post that would be most appropriate as a visual anchor
+        // This should be the post that appears near the top of the visible area
+        guard !indexByID.isEmpty else { return nil }
+
+        // Find the post with the minimum index (topmost in the feed)
+        // But bias towards posts that are more likely to be fully visible
+        let sortedByIndex = indexByID.sorted { $0.value < $1.value }
+
+        // If we have multiple visible posts, prefer one that's likely to be
+        // more prominently visible rather than just the first one
+        if sortedByIndex.count >= 2 {
+            // Use the second post if it exists, as it's more likely to be
+            // the one the user perceives as "at the top" of their view
+            return sortedByIndex[1].key
+        } else {
+            // Fall back to the first post if that's all we have
+            return sortedByIndex.first?.key
+        }
+    }
+}
+
+private extension TimelineList {
+    func applyAnchorCandidate(_ candidate: String?) {
+        guard !jumpInProgress && !suppressAnchorUpdates else { return }
+        if anchorID != candidate { anchorID = candidate }
     }
 }

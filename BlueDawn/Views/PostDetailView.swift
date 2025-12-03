@@ -108,7 +108,7 @@ struct PostDetailView: View {
                             profileRoute = ProfileRoute(network: net, handle: handle)
                         })
                     }
-                    if !post.media.isEmpty { mediaGrid }
+                    if !post.media.isEmpty { mediaCarousel }
                     actionBar
                 }
                 .id("focusedPost")
@@ -267,56 +267,62 @@ struct PostDetailView: View {
     }
 
     // MARK: - Media
-    private var mediaGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)], spacing: 10) {
-            ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
-                Group {
-                    switch m.kind {
-                    case .image:
-                        Button { imageViewer = ImageViewerState(post: post, index: idx) } label: {
-                            AsyncImage(url: m.url) { phase in
-                                switch phase {
-                                case .empty:
-                                    Rectangle().fill(Color.secondary.opacity(0.1)).overlay(ProgressView())
-                                case .success(let image):
-                                    image.resizable().scaledToFill()
-                                case .failure:
-                                    Rectangle().fill(Color.secondary.opacity(0.15)).overlay(Image(systemName: "photo"))
-                                @unknown default:
-                                    Rectangle().fill(Color.secondary.opacity(0.15))
+    private var mediaCarousel: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(spacing: 12) {
+                ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
+                    Group {
+                        switch m.kind {
+                        case .image:
+                            Button { imageViewer = ImageViewerState(post: post, index: idx) } label: {
+                                AsyncImage(url: m.url) { phase in
+                                    switch phase {
+                                    case .empty:
+                                        Rectangle().fill(Color.secondary.opacity(0.1))
+                                            .overlay(ProgressView())
+                                    case .success(let image):
+                                        image.resizable().scaledToFill()
+                                    case .failure:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                            .overlay(Image(systemName: "photo").font(.title3))
+                                    @unknown default:
+                                        Rectangle().fill(Color.secondary.opacity(0.15))
+                                    }
                                 }
                             }
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel(m.altText ?? "Image")
-                    case .video, .gif:
-                        ZStack {
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(m.altText ?? "Image")
+                        case .video, .gif:
                             InlineVideoView(url: m.url)
-                            // Fullscreen button overlay
-                            VStack { Spacer() }
                                 .overlay(alignment: .bottomTrailing) {
                                     Button {
                                         NotificationCenter.default.post(name: Notification.Name("InlineVideoPauseAll"), object: nil)
                                         imageViewer = ImageViewerState(post: post, index: idx)
                                     } label: {
                                         Image(systemName: "arrow.up.left.and.arrow.down.right")
-                                            .font(.system(size: 14, weight: .semibold))
-                                            .padding(8)
+                                            .font(.system(size: 13, weight: .semibold))
+                                            .padding(6)
                                             .background(.ultraThinMaterial, in: Capsule())
                                     }
                                     .buttonStyle(.plain)
-                                    .padding(8)
+                                    .padding(6)
                                     .accessibilityLabel("Open full screen")
                                 }
+                                .accessibilityLabel(m.altText ?? "Video")
                         }
-                        .accessibilityLabel(m.altText ?? "Video")
                     }
+                    .frame(width: 280, height: 200)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
+                    )
                 }
-                .frame(height: 200)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.secondary.opacity(0.15), lineWidth: 0.5))
             }
+            .scrollTargetLayout()
         }
+        .scrollTargetBehavior(.viewAligned)
+        .safeAreaPadding(.horizontal, 16)
     }
 
     // MARK: - Replies
