@@ -13,7 +13,7 @@ struct BlueskyClient: SocialClient {
         comps?.queryItems = items
 
         guard let url = comps?.url else { throw URLError(.badURL) }
-        // Load the authed user's DID and their following DIDs so we can filter replies reliably
+        // Load authed user's DID and follow set for reply filtering
         struct Session: Decodable { let did: String; let handle: String }
         func getSession() async throws -> Session {
             var sComps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
@@ -53,11 +53,13 @@ struct BlueskyClient: SocialClient {
         let mapped = tl.feed.compactMap { feedItem -> UnifiedPost? in
             let p = feedItem.post
             guard let rec = p.record, rec.type == "app.bsky.feed.post" else { return nil }
-            // Exclude replies unless they are to authors I follow
-            if let r = p.reply, let parentAuthor = r.parent?.author {
+            if let reply = feedItem.reply, let parentAuthor = reply.parent?.author {
                 let followedViaViewer = (parentAuthor.viewer?.following != nil)
                 let followedViaSet = followingDIDs.contains(parentAuthor.did)
                 if !(followedViaViewer || followedViaSet) { return nil }
+            } else if feedItem.reply != nil {
+                // Reply context present but no parent author → drop it
+                return nil
             }
             let isRepost = (feedItem.reason?.type == "app.bsky.feed.defs#reasonRepost")
             let boostedHandle = isRepost ? feedItem.reason?.by?.handle : nil
@@ -123,6 +125,37 @@ struct BlueskyClient: SocialClient {
         return stack.reversed()
     }
 
+    // MARK: - Fetch a single post by actor/rkey (from bsky.app link)
+    func fetchPost(actorOrHandle actor: String, rkey: String) async throws -> UnifiedPost? {
+        // Resolve handle to DID if needed
+        let did = try await resolveDID(for: actor)
+        var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/xrpc/app.bsky.feed.getPostThread"
+        let atUri = "at://\(did)/app.bsky.feed.post/\(rkey)"
+        comps?.queryItems = [URLQueryItem(name: "uri", value: atUri)]
+        guard let url = comps?.url else { throw URLError(.badURL) }
+
+        let data = try await performGET(url)
+        let decoder = JSONDecoder()
+        let resp = try decoder.decode(GetPostThreadResponse.self, from: data)
+        if case let .threadViewPost(node) = resp.thread {
+            return mapPostToUnified(node.post)
+        }
+        return nil
+    }
+
+    private func resolveDID(for actorOrDid: String) async throws -> String {
+        if actorOrDid.hasPrefix("did:") { return actorOrDid }
+        var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/xrpc/com.atproto.identity.resolveHandle"
+        comps?.queryItems = [URLQueryItem(name: "handle", value: actorOrDid)]
+        guard let url = comps?.url else { throw URLError(.badURL) }
+        struct Resp: Decodable { let did: String }
+        let data = try await performGET(url)
+        let r = try JSONDecoder().decode(Resp.self, from: data)
+        return r.did
+    }
+
     // MARK: - Profile
     func fetchUserProfile(handle: String) async throws -> UnifiedUser {
         var comps = URLComponents(url: pdsURL, resolvingAgainstBaseURL: false)
@@ -136,7 +169,7 @@ struct BlueskyClient: SocialClient {
         do { prof = try JSONDecoder().decode(BskyProfile.self, from: data) }
         catch let e as DecodingError { throw APIError.decoding(e) }
         let bio = prof.description.flatMap { AttributedString($0) }
-        return UnifiedUser(
+        var u = UnifiedUser(
             id: "bsky:\(prof.did)",
             network: .bluesky,
             handle: prof.handle,
@@ -147,6 +180,20 @@ struct BlueskyClient: SocialClient {
             followingCount: prof.followsCount,
             postsCount: prof.postsCount
         )
+        if let viewer = prof.viewer {
+            if let followingUri = viewer.following {
+                u.isFollowing = true
+                u.bskyFollowRkey = Self.extractRkey(fromAtUri: followingUri)
+            } else {
+                u.isFollowing = false
+                u.bskyFollowRkey = nil
+            }
+        } else {
+            // Viewer info absent → unknown follow state
+            u.isFollowing = nil
+            u.bskyFollowRkey = nil
+        }
+        return u
     }
 
     // MARK: - Author feed
@@ -292,6 +339,59 @@ struct BlueskyClient: SocialClient {
     }
     func reply(to post: UnifiedPost, text: String) async throws { /* TODO: app.bsky.feed.post */ }
 
+    // MARK: - Follow / Unfollow
+    /// Follows the given Bluesky DID. Returns the created follow record rkey for future unfollow.
+    func followUser(did targetDid: String) async throws -> String? {
+        guard !targetDid.isEmpty else { return nil }
+        guard let repoDid = did else { throw APIError.unknown(URLError(.userAuthenticationRequired)) }
+        var url = pdsURL; url.append(path: "/xrpc/com.atproto.repo.createRecord")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        struct Record: Encodable {
+            let type = "app.bsky.graph.follow"
+            let subject: String
+            let createdAt: String
+            enum CodingKeys: String, CodingKey { case subject, createdAt; case type = "$type" }
+        }
+        struct Body: Encodable { let repo: String; let collection: String; let record: Record }
+
+        let createdAt = ISO8601DateFormatter().string(from: Date())
+        let body = Body(repo: repoDid, collection: "app.bsky.graph.follow", record: Record(subject: targetDid, createdAt: createdAt))
+        req.httpBody = try JSONEncoder().encode(body)
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let bodyStr = String(data: data, encoding: .utf8)
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1, body: bodyStr)
+        }
+        struct CreateResp: Decodable { let uri: String }
+        if let decoded = try? JSONDecoder().decode(CreateResp.self, from: data) {
+            return Self.extractRkey(fromAtUri: decoded.uri)
+        }
+        return nil
+    }
+
+    /// Unfollows using the follow record rkey.
+    func unfollowUser(rkey: String) async throws {
+        guard let repoDid = did else { throw APIError.unknown(URLError(.userAuthenticationRequired)) }
+        var url = pdsURL; url.append(path: "/xrpc/com.atproto.repo.deleteRecord")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        struct Body: Encodable { let repo: String; let collection: String; let rkey: String }
+        let body = Body(repo: repoDid, collection: "app.bsky.graph.follow", rkey: rkey)
+        req.httpBody = try JSONEncoder().encode(body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let bodyStr = String(data: data, encoding: .utf8)
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1, body: bodyStr)
+        }
+    }
+
     // MARK: - Request helper
     private func performGET(_ url: URL) async throws -> Data {
         var req = URLRequest(url: url)
@@ -398,18 +498,46 @@ struct BlueskyClient: SocialClient {
     private func mapPostToUnified(_ p: Post, isRepost: Bool = false, boostedByHandle: String? = nil, boostedByDisplayName: String? = nil) -> UnifiedPost {
         let created = parseISO8601(p.record?.createdAt ?? p.indexedAt ?? "") ?? Date()
         let text = attributedFromBsky(text: p.record?.text ?? "", facets: p.record?.facets)
-        let media: [Media] = {
-            guard let embed = p.embed else { return [] }
+        var media: [Media] = []
+        var quoted: QuotedPost? = nil
+        var externalURL: URL? = nil
+        if let embed = p.embed {
             switch embed {
             case .images(let view):
-                return view.images.compactMap { img in
+                media = view.images.compactMap { img in
                     guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
                     return Media(url: url, altText: img.alt, kind: .image)
                 }
-            default:
-                return []
+            case .video(let view):
+                if let videoMedia = mediaFromVideo(view) {
+                    media = [videoMedia]
+                }
+            case .record(let rv):
+                if case .view(let r) = rv.record { quoted = mapEmbeddedRecordToQuoted(r) }
+            case .recordWithMedia(let rwm):
+                if case .view(let r) = rwm.record {
+                    var quotedMedia: [Media] = []
+                    if let m = rwm.media {
+                        switch m {
+                        case .images(let view):
+                            quotedMedia = view.images.compactMap { img in
+                                guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
+                                return Media(url: url, altText: img.alt, kind: .image)
+                            }
+                        case .video(let view):
+                            if let vm = mediaFromVideo(view) { quotedMedia = [vm] }
+                        default:
+                            break
+                        }
+                    }
+                    quoted = mapEmbeddedRecordToQuoted(r, media: quotedMedia)
+                }
+            case .external(let extView):
+                externalURL = URL(string: extView.external.uri)
+            case .unsupported:
+                break
             }
-        }()
+        }
         let counts = PostCounts(
             replies: p.replyCount,
             boostsReposts: p.repostCount,
@@ -444,7 +572,9 @@ struct BlueskyClient: SocialClient {
             isReposted: isReposted,
             isBookmarked: false,
             boostedByHandle: boostedByHandle,
-            boostedByDisplayName: boostedByDisplayName
+            boostedByDisplayName: boostedByDisplayName,
+            externalURL: externalURL,
+            quotedPost: quoted
         )
     }
 
@@ -495,7 +625,19 @@ struct BlueskyClient: SocialClient {
 
     private struct FeedViewPost: Decodable {
         let post: Post
+        let reply: ReplyRef?
         let reason: Reason?
+    }
+
+    private struct ReplyRef: Decodable {
+        let root: ReplyPost?
+        let parent: ReplyPost?
+    }
+
+    private struct ReplyPost: Decodable {
+        let uri: String?
+        let cid: String?
+        let author: Author?
     }
 
     private struct Reason: Decodable {
@@ -626,6 +768,10 @@ struct BlueskyClient: SocialClient {
 
     private enum Embed: Decodable {
         case images(ImagesView)
+        case video(VideoView)
+        case record(RecordView)
+        indirect case recordWithMedia(RecordWithMediaView)
+        case external(ExternalView)
         case unsupported
 
         init(from decoder: Decoder) throws {
@@ -634,10 +780,117 @@ struct BlueskyClient: SocialClient {
             switch type {
             case "app.bsky.embed.images#view":
                 self = .images(try ImagesView(from: decoder))
+            case "app.bsky.embed.video#view":
+                self = .video(try VideoView(from: decoder))
+            case "app.bsky.embed.record#view":
+                self = .record(try RecordView(from: decoder))
+            case "app.bsky.embed.recordWithMedia#view":
+                self = .recordWithMedia(try RecordWithMediaView(from: decoder))
+            case "app.bsky.embed.external#view":
+                self = .external(try ExternalView(from: decoder))
             default:
                 self = .unsupported
             }
         }
+    }
+
+    private struct RecordView: Decodable {
+        let record: EmbeddedRecord
+        enum CodingKeys: String, CodingKey { case record }
+    }
+
+    private struct ExternalView: Decodable {
+        let external: External
+        enum CodingKeys: String, CodingKey { case external }
+
+        struct External: Decodable {
+            let uri: String
+            let title: String
+            let description: String
+            let thumb: String?
+        }
+    }
+
+    private struct RecordWithMediaView: Decodable {
+        let record: EmbeddedRecord
+        let media: Embed?
+        enum CodingKeys: String, CodingKey { case record, media }
+    }
+
+    private enum EmbeddedRecord: Decodable {
+        case view(ViewRecord)
+        case blocked
+        case notFound
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: DynamicCodingKeys.self)
+            let type = try c.decodeIfPresent(String.self, forKey: DynamicCodingKeys(stringValue: "$type")!) ?? ""
+            switch type {
+            case "app.bsky.embed.record#viewRecord":
+                self = .view(try ViewRecord(from: decoder))
+            case "app.bsky.embed.record#viewBlocked":
+                self = .blocked
+            case "app.bsky.embed.record#viewNotFound":
+                self = .notFound
+            default:
+                self = .notFound
+            }
+        }
+    }
+
+    private struct ViewRecord: Decodable {
+        let uri: String
+        let cid: String
+        let author: Author
+        let value: RecordValue?
+        let embeds: [Embed]?
+    }
+
+    private struct RecordValue: Decodable {
+        let text: String?
+        let createdAt: String?
+        let facets: [Facet]?
+    }
+
+    private func mediaFromVideo(_ video: VideoView) -> Media? {
+        guard let playlist = video.playlist, let url = URL(string: playlist) else { return nil }
+        let kind: Media.Kind = (video.isGif ?? false) ? .gif : .video
+        return Media(url: url, altText: video.alt, kind: kind)
+    }
+
+    private func mapEmbeddedRecordToQuoted(_ r: ViewRecord, media: [Media] = []) -> QuotedPost {
+        let created = parseISO8601(r.value?.createdAt ?? "") ?? Date()
+        let text = attributedFromBsky(text: r.value?.text ?? "", facets: r.value?.facets)
+
+        // Extract media from the quoted post's own embeds
+        var quotedMedia = media
+        if let embeds = r.embeds {
+            for embed in embeds {
+                switch embed {
+                case .images(let view):
+                    let embedMedia: [Media] = view.images.compactMap { img in
+                        guard let url = URL(string: img.fullsize ?? img.thumb ?? "") else { return nil }
+                        return Media(url: url, altText: img.alt, kind: .image)
+                    }
+                    quotedMedia.append(contentsOf: embedMedia)
+                case .video(let view):
+                    if let vm = mediaFromVideo(view) { quotedMedia.append(vm) }
+                default:
+                    break
+                }
+            }
+        }
+
+        return QuotedPost(
+            id: "bsky:\(r.uri)",
+            network: .bluesky,
+            authorHandle: r.author.handle,
+            authorDisplayName: r.author.displayName,
+            authorAvatarURL: URL(string: r.author.avatar ?? ""),
+            createdAt: created,
+            text: text,
+            media: quotedMedia
+        )
     }
 
     private struct ImagesView: Decodable {
@@ -646,6 +899,20 @@ struct BlueskyClient: SocialClient {
             let thumb: String?
             let fullsize: String?
             let alt: String?
+        }
+    }
+
+    private struct VideoView: Decodable {
+        let cid: String?
+        let playlist: String?
+        let thumbnail: String?
+        let alt: String?
+        let aspectRatio: AspectRatio?
+        let isGif: Bool?
+
+        struct AspectRatio: Decodable {
+            let width: Int?
+            let height: Int?
         }
     }
 
@@ -666,6 +933,8 @@ struct BlueskyClient: SocialClient {
         let followersCount: Int?
         let followsCount: Int?
         let postsCount: Int?
+        let viewer: ProfileViewer?
+        struct ProfileViewer: Decodable { let following: String? }
     }
 
     private struct AuthorFeedResponse: Decodable {

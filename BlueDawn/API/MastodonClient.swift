@@ -3,6 +3,7 @@ import Foundation
 struct MastodonClient: SocialClient {
     let baseURL: URL // e.g., https://mastodon.social
     let accessToken: String
+    private let maxQuoteEnrichmentsPerPage = 6
 
     // MARK: Home timeline
     func fetchHomeTimeline(cursor: String?) async throws -> (posts: [UnifiedPost], nextCursor: String?) {
@@ -14,10 +15,11 @@ struct MastodonClient: SocialClient {
         if let cursor = cursor { items.append(URLQueryItem(name: "max_id", value: cursor)) }
         comps.queryItems = items
         guard let url = comps.url else { throw URLError(.badURL) }
+        async let followInfo = loadFollowingSetIfAvailable()
 
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -26,9 +28,172 @@ struct MastodonClient: SocialClient {
         }
 
         let statuses = try JSONDecoder().decode([MastoStatus].self, from: data)
-        let mapped = statuses.map { mapStatusToUnified($0) }
+        let followingData = try await followInfo
+        let filteredStatuses = filterReplies(statuses, using: followingData)
+        var mapped = filteredStatuses.map { mapStatusToUnified($0) }
+
+        // Enrich posts that link to another Mastodon status (same or cross-instance)
+        var remainingQuoteFetches = maxQuoteEnrichmentsPerPage
+        for i in 0..<min(filteredStatuses.count, mapped.count) {
+            if remainingQuoteFetches <= 0 { break }
+            if mapped[i].quotedPost == nil, let link = extractLinkedStatus(fromHTML: filteredStatuses[i].content) {
+                remainingQuoteFetches -= 1
+                if let qp = try await fetchQuotedStatus(host: link.host, id: link.id) {
+                    mapped[i].quotedPost = qp
+                }
+            }
+        }
         let nextCursor = statuses.last?.id
         return (mapped, nextCursor)
+    }
+
+    // Fetch newer statuses than the given since_id (Mastodon supports this natively).
+    // Returns newest-first posts and does not include the since_id item itself.
+    func fetchHomeTimelineSince(sinceID: String) async throws -> [UnifiedPost] {
+        guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            throw URLError(.badURL)
+        }
+        comps.path = "/api/v1/timelines/home"
+        // Mastodon returns newest-first by default; using since_id will fetch items with id > since_id
+        comps.queryItems = [
+            URLQueryItem(name: "limit", value: "40"),
+            URLQueryItem(name: "since_id", value: sinceID)
+        ]
+        guard let url = comps.url else { throw URLError(.badURL) }
+        async let followInfo = loadFollowingSetIfAvailable()
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        let statuses = try JSONDecoder().decode([MastoStatus].self, from: data)
+        let followingData = try await followInfo
+        let filteredStatuses = filterReplies(statuses, using: followingData)
+        var mapped = filteredStatuses.map { mapStatusToUnified($0) }
+        // Enrich quotes in the new batch (bounded)
+        var remainingQuoteFetches = maxQuoteEnrichmentsPerPage
+        for i in 0..<min(filteredStatuses.count, mapped.count) {
+            if remainingQuoteFetches <= 0 { break }
+            if mapped[i].quotedPost == nil, let link = extractLinkedStatus(fromHTML: filteredStatuses[i].content) {
+                remainingQuoteFetches -= 1
+                if let qp = try await fetchQuotedStatus(host: link.host, id: link.id) {
+                    mapped[i].quotedPost = qp
+                }
+            }
+        }
+        return mapped
+    }
+
+    private func loadFollowingSetIfAvailable() async throws -> (selfID: String, following: Set<String>)? {
+        guard !accessToken.isEmpty else { return nil }
+        let authedID = try await fetchAuthedAccountID()
+        let following = try await fetchFollowingSet(accountID: authedID)
+        return (authedID, following)
+    }
+
+    private struct VerifyCredentialsResponse: Decodable { let id: String }
+
+    private func fetchAuthedAccountID() async throws -> String {
+        var url = baseURL
+        url.append(path: "/api/v1/accounts/verify_credentials")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+        let me = try JSONDecoder().decode(VerifyCredentialsResponse.self, from: data)
+        return me.id
+    }
+
+    private func fetchFollowingSet(accountID: String, cap: Int = 4000) async throws -> Set<String> {
+        var out = Set<String>()
+        var maxID: String? = nil
+        let decoder = JSONDecoder()
+        repeat {
+            guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { break }
+            comps.path = "/api/v1/accounts/\(accountID)/following"
+            var queryItems = [URLQueryItem(name: "limit", value: "80")]
+            if let maxID { queryItems.append(URLQueryItem(name: "max_id", value: maxID)) }
+            comps.queryItems = queryItems
+            guard let pageURL = comps.url else { break }
+            var req = URLRequest(url: pageURL)
+            req.httpMethod = "GET"
+            req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Accept")
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+            }
+            let page = try decoder.decode([Account].self, from: data)
+            guard !page.isEmpty else { break }
+            for acct in page { out.insert(acct.id) }
+            maxID = page.last?.id
+        } while maxID != nil && out.count < cap
+        return out
+    }
+
+    private func filterReplies(_ statuses: [MastoStatus], using info: (selfID: String, following: Set<String>)?) -> [MastoStatus] {
+        guard let info = info else { return statuses }
+        return statuses.filter { status in
+            guard let parentAccountID = status.in_reply_to_account_id else { return true }
+            if parentAccountID == info.selfID { return true }
+            return info.following.contains(parentAccountID)
+        }
+    }
+
+    // Try to find a linked Mastodon status URL in the content HTML.
+    // Supports patterns like:
+    //  - https://example.org/@user/123456789
+    //  - https://example.org/users/user/statuses/123456789
+    private func extractLinkedStatus(fromHTML html: String) -> (host: String, id: String)? {
+        // Very light anchor HREF extraction
+        let pattern = #"<a[^>]+href=\"([^\"]+)\""#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
+        let ns = html as NSString
+        let matches = regex.matches(in: html, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches {
+            if m.numberOfRanges < 2 { continue }
+            let urlStr = ns.substring(with: m.range(at: 1))
+            guard let url = URL(string: urlStr) else { continue }
+            guard let host = url.host else { continue }
+            let comps = url.pathComponents.filter { $0 != "/" }
+            // Patterns: /@user/<id> OR /users/<acct>/statuses/<id>
+            if let last = comps.last, CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: last)) {
+                return (host, last)
+            }
+            if let idx = comps.firstIndex(of: "statuses"), idx + 1 < comps.count {
+                let cand = comps[idx + 1]
+                if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: cand)) {
+                    return (host, cand)
+                }
+            }
+        }
+        return nil
+    }
+
+    private func fetchQuotedStatus(host: String, id: String) async throws -> QuotedPost? {
+        var comps = URLComponents()
+        comps.scheme = baseURL.scheme
+        comps.host = host
+        comps.path = "/api/v1/statuses/\(id)"
+        guard let url = comps.url else { return nil }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        // Public fetch; do not attach Authorization for remote hosts
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+        guard let s = try? JSONDecoder().decode(MastoStatus.self, from: data) else { return nil }
+        return mapStatusToQuoted(s, instanceHost: host)
     }
 
     // MARK: Thread replies (descendants)
@@ -40,7 +205,7 @@ struct MastodonClient: SocialClient {
 
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -73,6 +238,21 @@ struct MastodonClient: SocialClient {
         }
     }
 
+    // MARK: - Single status fetch (public)
+    /// Fetch a single status by id from this client's baseURL and map to UnifiedPost.
+    func fetchStatus(id: String) async throws -> UnifiedPost? {
+        var url = baseURL
+        url.append(path: "/api/v1/statuses/\(id)")
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+        guard let s = try? JSONDecoder().decode(MastoStatus.self, from: data) else { return nil }
+        return mapStatusToUnified(s)
+    }
+
     // MARK: Thread ancestors (parents)
     func fetchAncestors(root post: UnifiedPost) async throws -> [UnifiedPost] {
         guard let id = post.id.split(separator: ":").last.map(String.init) else { return [] }
@@ -81,7 +261,7 @@ struct MastodonClient: SocialClient {
 
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
         let (data, resp) = try await URLSession.shared.data(for: req)
@@ -100,7 +280,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/favourite")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -115,7 +295,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/reblog")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -130,7 +310,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/unfavourite")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -144,7 +324,7 @@ struct MastodonClient: SocialClient {
         var url = baseURL; url.append(path: "/api/v1/statuses/\(id)/unreblog")
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         let (_, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -158,7 +338,7 @@ struct MastodonClient: SocialClient {
     func fetchUserProfile(handle: String) async throws -> UnifiedUser {
         let acct = try await lookupAccount(handle: handle)
         let bio = htmlToAttributed(acct.note ?? "")
-        return UnifiedUser(
+        var user = UnifiedUser(
             id: "mastodon:\(acct.id)",
             network: .mastodon(instance: baseURL.host ?? baseURL.absoluteString),
             handle: acct.acct,
@@ -169,6 +349,13 @@ struct MastodonClient: SocialClient {
             followingCount: acct.following_count,
             postsCount: acct.statuses_count
         )
+        // If authenticated, fetch relationship to determine follow state
+        if !accessToken.isEmpty {
+            if let rel = try? await relationship(id: acct.id) {
+                user.isFollowing = rel.following
+            }
+        }
+        return user
     }
 
     // MARK: - Author feed
@@ -193,7 +380,17 @@ struct MastodonClient: SocialClient {
         }
 
         let statuses = try JSONDecoder().decode([MastoStatus].self, from: data)
-        let mapped = statuses.map { mapStatusToUnified($0) }
+        var mapped = statuses.map { mapStatusToUnified($0) }
+        var remainingQuoteFetches = maxQuoteEnrichmentsPerPage
+        for i in 0..<min(statuses.count, mapped.count) {
+            if remainingQuoteFetches <= 0 { break }
+            if mapped[i].quotedPost == nil, let link = extractLinkedStatus(fromHTML: statuses[i].content) {
+                remainingQuoteFetches -= 1
+                if let qp = try await fetchQuotedStatus(host: link.host, id: link.id) {
+                    mapped[i].quotedPost = qp
+                }
+            }
+        }
         let next = statuses.last?.id
         return (mapped, next)
     }
@@ -202,7 +399,16 @@ struct MastodonClient: SocialClient {
     private func lookupAccount(handle: String) async throws -> Account {
         guard var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { throw URLError(.badURL) }
         comps.path = "/api/v1/accounts/lookup"
-        comps.queryItems = [ URLQueryItem(name: "acct", value: handle) ]
+        // If handle includes @domain matching this instance, strip it for reliability
+        let acct: String = {
+            if let at = handle.firstIndex(of: "@") {
+                let name = String(handle[..<at])
+                let domain = String(handle[handle.index(after: at)...])
+                if domain == (baseURL.host ?? domain) { return name }
+            }
+            return handle
+        }()
+        comps.queryItems = [ URLQueryItem(name: "acct", value: acct) ]
         guard let url = comps.url else { throw URLError(.badURL) }
 
         var req = URLRequest(url: url)
@@ -210,12 +416,28 @@ struct MastodonClient: SocialClient {
         req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+            }
+            return try JSONDecoder().decode(Account.self, from: data)
+        } catch {
+            // Fallback: try with full acct including domain if initial stripped form failed
+            if acct == handle { throw error }
+            var comps2 = comps
+            comps2.queryItems = [ URLQueryItem(name: "acct", value: handle) ]
+            guard let url2 = comps2.url else { throw URLError(.badURL) }
+            var req2 = URLRequest(url: url2)
+            req2.httpMethod = "GET"
+            if !accessToken.isEmpty { req2.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+            req2.setValue("application/json", forHTTPHeaderField: "Accept")
+            let (data2, resp2) = try await URLSession.shared.data(for: req2)
+            guard let http2 = resp2 as? HTTPURLResponse, (200..<300).contains(http2.statusCode) else {
+                throw APIError.badStatus((resp2 as? HTTPURLResponse)?.statusCode ?? -1)
+            }
+            return try JSONDecoder().decode(Account.self, from: data2)
         }
-
-        return try JSONDecoder().decode(Account.self, from: data)
     }
 
     // MARK: - Mapping helpers
@@ -255,6 +477,12 @@ struct MastodonClient: SocialClient {
             return arr.isEmpty ? nil : arr
         }()
 
+        // Quoted post (if present)
+        let quoted: QuotedPost? = {
+            if let q = s.quote { return mapReblogToQuoted(q) }
+            return nil
+        }()
+
         return UnifiedPost(
             id: "mastodon:\(src.id)",
             network: .mastodon(instance: baseURL.host ?? baseURL.absoluteString),
@@ -273,7 +501,61 @@ struct MastodonClient: SocialClient {
             isReposted: s.reblogged ?? false,
             isBookmarked: s.bookmarked ?? false,
             boostedByHandle: boostedHandle,
-            boostedByDisplayName: boostedName
+            boostedByDisplayName: boostedName,
+            quotedPost: quoted
+        )
+    }
+
+    // Map a full status to a compact quoted post (no nested quotes/thread fields)
+    private func mapStatusToQuoted(_ s: MastoStatus, instanceHost: String? = nil) -> QuotedPost {
+        let created = parseISO8601(s.created_at) ?? Date()
+        let text: AttributedString = HTML.toAttributed(s.content)
+        let media: [Media] = s.media_attachments.compactMap { att in
+            let kind: Media.Kind
+            switch att.type {
+            case "image": kind = .image
+            case "video": kind = .video
+            case "gifv":  kind = .gif
+            default:       kind = .image
+            }
+            guard let u = URL(string: att.url) ?? (att.preview_url.flatMap(URL.init(string:))) else { return nil }
+            return Media(url: u, altText: att.description, kind: kind)
+        }
+        return QuotedPost(
+            id: "mastodon:\(s.id)",
+            network: .mastodon(instance: instanceHost ?? (baseURL.host ?? baseURL.absoluteString)),
+            authorHandle: s.account.acct,
+            authorDisplayName: s.account.display_name.isEmpty ? nil : s.account.display_name,
+            authorAvatarURL: URL(string: s.account.avatar),
+            createdAt: created,
+            text: text,
+            media: media
+        )
+    }
+    
+    private func mapReblogToQuoted(_ src: MastoReblog) -> QuotedPost {
+        let created = parseISO8601(src.created_at) ?? Date()
+        let text: AttributedString = HTML.toAttributed(src.content)
+        let media: [Media] = src.media_attachments.compactMap { att in
+            let kind: Media.Kind
+            switch att.type {
+            case "image": kind = .image
+            case "video": kind = .video
+            case "gifv":  kind = .gif
+            default:       kind = .image
+            }
+            guard let u = URL(string: att.url) ?? (att.preview_url.flatMap(URL.init(string:))) else { return nil }
+            return Media(url: u, altText: att.description, kind: kind)
+        }
+        return QuotedPost(
+            id: "mastodon:\(src.id)",
+            network: .mastodon(instance: baseURL.host ?? baseURL.absoluteString),
+            authorHandle: src.account.acct,
+            authorDisplayName: src.account.display_name.isEmpty ? nil : src.account.display_name,
+            authorAvatarURL: URL(string: src.account.avatar),
+            createdAt: created,
+            text: text,
+            media: media
         )
     }
 
@@ -302,12 +584,16 @@ struct MastodonClient: SocialClient {
         let id: String
         let created_at: String
         let in_reply_to_id: String?
+        let in_reply_to_account_id: String?
         let sensitive: Bool?
         let spoiler_text: String?
         let content: String
         let account: Account
         let media_attachments: [MediaAttachment]
         let reblog: MastoReblog?
+        // Optional quoted post support (Mastodon 4.2+ on some servers)
+        let quote: MastoReblog?
+        let quote_id: String?
         let replies_count: Int?
         let reblogs_count: Int?
         let favourites_count: Int?
@@ -325,6 +611,48 @@ struct MastodonClient: SocialClient {
         let followers_count: Int?
         let following_count: Int?
         let statuses_count: Int?
+    }
+
+    private struct Relationship: Decodable { let id: String; let following: Bool? }
+
+    private func relationship(id: String) async throws -> Relationship? {
+        var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+        comps?.path = "/api/v1/accounts/relationships"
+        comps?.queryItems = [URLQueryItem(name: "id[]", value: id)]
+        guard let url = comps?.url else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+        let arr = try JSONDecoder().decode([Relationship].self, from: data)
+        return arr.first
+    }
+
+    // MARK: - Follow / Unfollow
+    func followUser(id: String) async throws {
+        var url = baseURL; url.append(path: "/api/v1/accounts/\(id)/follow")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+    }
+
+    func unfollowUser(id: String) async throws {
+        var url = baseURL; url.append(path: "/api/v1/accounts/\(id)/unfollow")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        if !accessToken.isEmpty { req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization") }
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (_, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw APIError.badStatus((resp as? HTTPURLResponse)?.statusCode ?? -1)
+        }
     }
 
     private struct MastoReblog: Decodable {

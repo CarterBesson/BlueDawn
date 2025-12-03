@@ -31,14 +31,7 @@ final class ThreadViewModel {
                 await session.ensureValidBlueskyAccess()
             }
 
-            let client: SocialClient? = {
-                switch root.network {
-                case .bluesky:
-                    return session.blueskyClient
-                case .mastodon(_):
-                    return session.mastodonClient
-                }
-            }()
+            let client: SocialClient? = clientFor(root)
 
             guard let client else {
                 self.items = []
@@ -57,6 +50,22 @@ final class ThreadViewModel {
             self.items = replies
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+}
+
+private extension ThreadViewModel {
+    func clientFor(_ post: UnifiedPost) -> SocialClient? {
+        switch post.network {
+        case .bluesky:
+            return session.blueskyClient
+        case .mastodon(let instance):
+            if let c = session.mastodonClient, c.baseURL.host == instance {
+                return c
+            }
+            // Fallback to a public client for the post's instance
+            guard let url = URL(string: "https://\(instance)") else { return nil }
+            return MastodonClient(baseURL: url, accessToken: "")
         }
     }
 }

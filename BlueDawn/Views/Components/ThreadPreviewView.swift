@@ -7,6 +7,7 @@ struct ThreadPreviewView: View {
     let onOpenProfile: (Network, String) -> Void
     let onOpenPost: (UnifiedPost) -> Void
     let onTapImage: (UnifiedPost, Int) -> Void
+    let onOpenExternalURL: (URL) -> Void
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -21,7 +22,9 @@ struct ThreadPreviewView: View {
                     post: rootPost,
                     showAvatar: false,
                     onOpenProfile: onOpenProfile,
-                    onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) }
+                    onOpenPost: onOpenPost,
+                    onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) },
+                    onOpenExternalURL: onOpenExternalURL
                 )
                 .contentShape(Rectangle())
                 .onTapGesture { onOpenPost(rootPost) }
@@ -71,7 +74,9 @@ struct ThreadPreviewView: View {
                             post: reply,
                             showAvatar: false,
                             onOpenProfile: onOpenProfile,
-                            onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) }
+                            onOpenPost: onOpenPost,
+                            onTapImage: { tappedPost, idx in onTapImage(tappedPost, idx) },
+                            onOpenExternalURL: onOpenExternalURL
                         )
                         .contentShape(Rectangle())
                         .onTapGesture { onOpenPost(reply) }

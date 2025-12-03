@@ -1,4 +1,9 @@
 import SwiftUI
+import Photos
+import AVKit
+#if canImport(UIKit)
+import UIKit
+#endif
 
 struct ImageViewerState: Identifiable {
     let id = UUID()
@@ -11,8 +16,103 @@ struct ImageViewer: View {
     @State var index: Int
     @State private var dragY: CGFloat = 0
     @State private var isZoomed: Bool = false
+    @State private var showAltText: Bool = false
+    @State private var isDownloading: Bool = false
+    @State private var showAlert: Bool = false
+    @State private var alertTitle: String = ""
+    @State private var alertMessage: String = ""
+    @State private var showActions: Bool = false
+    @State private var showShare: Bool = false
+    @State private var shareItems: [Any] = []
     private let dismissThreshold: CGFloat = 140
     @Environment(\.dismiss) private var dismiss
+
+    private enum UI {
+        static let controlSize: CGFloat = 36
+        static let iconSize: CGFloat = 17
+    }
+
+    private struct VideoPageView: View {
+        let url: URL
+        @Binding var currentIndex: Int
+        let myIndex: Int
+        @State private var player: AVPlayer = AVPlayer()
+        @State private var isMuted = true
+        @State private var isPlaying = false
+        @State private var didInitMute = false
+        @Environment(SessionStore.self) private var session
+
+        var body: some View {
+            ZStack {
+                VideoPlayer(player: player)
+                    .onAppear {
+                        if player.currentItem == nil { player.replaceCurrentItem(with: AVPlayerItem(url: url)) }
+                        if !didInitMute { isMuted = session.videoStartMuted; didInitMute = true }
+                        player.isMuted = isMuted
+                        if currentIndex == myIndex {
+                            if session.videoAutoplay { isPlaying = true; player.play() } else { isPlaying = false }
+                        }
+                        loop()
+                    }
+                    .onDisappear { isPlaying = false; player.pause() }
+                    .onChange(of: currentIndex) { _, new in
+                        if new == myIndex {
+                            if session.videoAutoplay { isPlaying = true; player.play() }
+                        } else {
+                            isPlaying = false; player.pause()
+                        }
+                    }
+
+                VStack {
+                    HStack {
+                        Button(action: { isMuted.toggle(); player.isMuted = isMuted }) {
+                            Image(systemName: isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(8)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(isMuted ? "Unmute" : "Mute")
+                        Spacer()
+                    }
+                    HStack {
+                        Button(action: togglePlay) {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundStyle(.white)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(isPlaying ? "Pause" : "Play")
+                        Spacer()
+                    }
+                    .padding(.top, 8)
+                    Spacer()
+                }
+                .padding(12)
+            }
+        }
+
+        private func loop() {
+            NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem, queue: .main) { _ in
+                Task { @MainActor in
+                    if session.videoLoop {
+                        player.seek(to: .zero)
+                        if currentIndex == myIndex && isPlaying { player.play() }
+                    } else {
+                        isPlaying = false
+                    }
+                }
+            }
+        }
+
+        private func togglePlay() {
+            isPlaying.toggle()
+            if isPlaying { player.play() } else { player.pause() }
+        }
+    }
 
     init(post: UnifiedPost, startIndex: Int) {
         self.post = post
@@ -27,14 +127,26 @@ struct ImageViewer: View {
             } else {
                 TabView(selection: $index) {
                     ForEach(Array(post.media.enumerated()), id: \.offset) { idx, m in
-                        ZoomableAsyncImage(url: m.url, isZoomed: $isZoomed)
-                            .tag(idx)
+                        Group {
+                            switch m.kind {
+                            case .image:
+                                ZoomableAsyncImage(url: m.url, isZoomed: $isZoomed)
+                            case .video, .gif:
+                                VideoPageView(url: m.url, currentIndex: $index, myIndex: idx)
+                            }
+                        }
+                        .tag(idx)
                     }
                 }
                 .tabViewStyle(.page(indexDisplayMode: .automatic))
+                // Reset zoom/alt state when changing pages so gestures behave predictably
+                .onChange(of: index) { _, _ in
+                    isZoomed = false
+                    showAltText = false
+                }
                 .offset(y: dragY)
                 .scaleEffect(1 - dragShrink)
-                .highPriorityGesture(
+                .simultaneousGesture(
                     DragGesture(minimumDistance: 10, coordinateSpace: .local)
                         .onChanged { value in
                             guard !isZoomed else { return }
@@ -58,22 +170,101 @@ struct ImageViewer: View {
                 )
             }
 
-            VStack {
-                HStack {
-                    Spacer()
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 28, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.9))
-                            .shadow(radius: 2)
+            VStack(spacing: 0) {
+                ZStack(alignment: .trailing) {
+                    // top gradient scrim for button contrast
+                    LinearGradient(colors: [Color.black.opacity(0.6), Color.black.opacity(0.0)],
+                                   startPoint: .top, endPoint: .bottom)
+                        .frame(height: 100)
+                        .frame(maxWidth: .infinity)
+                        .ignoresSafeArea(edges: .top)
+
+                    HStack(spacing: 8) {
+                        Spacer()
+
+                        if let alt = currentAltText, !alt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            controlButton("text.alignleft", label: showAltText ? "Hide alt text" : "Show alt text") {
+                                withAnimation(.snappy) { showAltText.toggle() }
+                            }
+                        }
+
+                        Button {
+                            showActions = true
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: UI.iconSize, weight: .semibold))
+                                .frame(width: UI.controlSize, height: UI.controlSize)
+                                .foregroundStyle(.white)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .shadow(radius: 1.5)
+                        }
+                        .accessibilityLabel("More options")
+
+                        if isDownloading {
+                            ProgressView()
+                                .tint(.white)
+                                .frame(width: UI.controlSize, height: UI.controlSize)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .shadow(radius: 1.5)
+                        }
+
+                        controlButton("xmark", label: "Close") {
+                            dismiss()
+                        }
                     }
-                    .padding(.top, 16)
-                    .padding(.trailing, 16)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
                 }
+
                 Spacer()
             }
-            .opacity(1 - min(Double(abs(dragY)) / 160.0, 1.0))
+            .opacity(controlsOpacity)
+            .animation(.easeInOut(duration: 0.18), value: isZoomed)
+            .allowsHitTesting(!isZoomed)
+
+            // Alt text overlay
+            if showAltText {
+                VStack {
+                    Spacer()
+                    AltTextOverlay(text: currentAltText)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 24)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+                .ignoresSafeArea()
+            }
         }
+        .alert(alertTitle, isPresented: $showAlert) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text(alertMessage)
+        }
+        .confirmationDialog("Media options", isPresented: $showActions, titleVisibility: .visible) {
+            if currentKind == .image {
+                Button("Download Image") { Task { await downloadCurrentImage() } }
+            } else {
+                Button("Save Video") { Task { await downloadCurrentVideo() } }
+            }
+            Button("Share") { shareCurrent() }
+            Button("Cancel", role: .cancel) { }
+        }
+        .sheet(isPresented: $showShare) {
+            ShareSheet(items: shareItems)
+        }
+    }
+
+    @ViewBuilder
+    private func controlButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: UI.iconSize, weight: .semibold))
+                .frame(width: UI.controlSize, height: UI.controlSize)
+                .foregroundStyle(.white)
+                .background(.ultraThinMaterial, in: Circle())
+                .shadow(radius: 1.5)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
     }
 
     private var backgroundOpacity: Double {
@@ -85,6 +276,136 @@ struct ImageViewer: View {
         let denom: CGFloat = 1000
         let limit: CGFloat = 0.1
         return min(abs(dragY) / denom, limit)
+    }
+
+    private var controlsOpacity: Double {
+        let drag = 1 - min(Double(abs(dragY)) / 160.0, 1.0)
+        return drag * (isZoomed ? 0.0 : 1.0)
+    }
+
+    private var currentAltText: String? {
+        guard post.media.indices.contains(index) else { return nil }
+        return post.media[index].altText
+    }
+
+    private var currentURL: URL? {
+        guard post.media.indices.contains(index) else { return nil }
+        return post.media[index].url
+    }
+
+    private var currentKind: Media.Kind? {
+        guard post.media.indices.contains(index) else { return nil }
+        return post.media[index].kind
+    }
+
+    private func shareCurrent() {
+        guard let url = currentURL else { return }
+        shareItems = [url]
+        showShare = true
+    }
+
+    @MainActor
+    private func downloadCurrentImage() async {
+        guard let url = currentURL else {
+            Haptics.notify(.error)
+            alertTitle = "Save Failed"
+            alertMessage = "Unable to determine image URL."
+            showAlert = true
+            return
+        }
+        isDownloading = true
+        defer { isDownloading = false }
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            guard let image = UIImage(data: data) else { throw NSError(domain: "Image", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid image data"]) }
+            try await saveToPhotos(image)
+            Haptics.notify(.success)
+            alertTitle = "Saved"
+            alertMessage = "Image saved to your Photos."
+            showAlert = true
+        } catch {
+            Haptics.notify(.error)
+            alertTitle = "Save Failed"
+            alertMessage = error.localizedDescription
+            showAlert = true
+        }
+    }
+
+    private func saveToPhotos(_ image: UIImage) async throws {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        let finalStatus: PHAuthorizationStatus
+        if status == .notDetermined {
+            finalStatus = await requestPhotosAddOnlyAuthorization()
+        } else {
+            finalStatus = status
+        }
+        guard finalStatus == .authorized || finalStatus == .limited else {
+            throw NSError(domain: "Photos", code: 1, userInfo: [NSLocalizedDescriptionKey: "Photos permission not granted."])
+        }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }, completionHandler: { success, error in
+                if let error = error { cont.resume(throwing: error) }
+                else if success { cont.resume(returning: ()) }
+                else { cont.resume(throwing: NSError(domain: "Photos", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unknown save error"])) }
+            })
+        }
+    }
+
+    private func requestPhotosAddOnlyAuthorization() async -> PHAuthorizationStatus {
+        await withCheckedContinuation { cont in
+            PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+                cont.resume(returning: status)
+            }
+        }
+    }
+
+    // MARK: - Video saving
+    @MainActor
+    private func downloadCurrentVideo() async {
+        guard let url = currentURL else { return }
+        isDownloading = true
+        defer { isDownloading = false }
+        do {
+            let (fileURL, _) = try await downloadToTemporaryFile(from: url)
+            try await saveVideoToPhotos(fileURL)
+            Haptics.notify(.success)
+            alertTitle = "Saved"
+            alertMessage = "Video saved to your Photos."
+            showAlert = true
+        } catch {
+            Haptics.notify(.error)
+            alertTitle = "Save Failed"
+            alertMessage = error.localizedDescription
+            showAlert = true
+        }
+    }
+
+    private func downloadToTemporaryFile(from remote: URL) async throws -> (URL, URLResponse) {
+        let (data, resp) = try await URLSession.shared.data(from: remote)
+        let ext = remote.pathExtension.isEmpty ? "mp4" : remote.pathExtension
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString).appendingPathExtension(ext)
+        try data.write(to: tmp)
+        return (tmp, resp)
+    }
+
+    private func saveVideoToPhotos(_ fileURL: URL) async throws {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        let finalStatus: PHAuthorizationStatus
+        if status == .notDetermined { finalStatus = await requestPhotosAddOnlyAuthorization() } else { finalStatus = status }
+        guard finalStatus == .authorized || finalStatus == .limited else {
+            throw NSError(domain: "Photos", code: 1, userInfo: [NSLocalizedDescriptionKey: "Photos permission not granted."])
+        }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: fileURL)
+            }, completionHandler: { success, error in
+                if let error = error { cont.resume(throwing: error) }
+                else if success { cont.resume(returning: ()) }
+                else { cont.resume(throwing: NSError(domain: "Photos", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unknown video save error"])) }
+            })
+        }
     }
 }
 
@@ -117,6 +438,8 @@ struct ZoomableAsyncImage: View {
                 }
                 .frame(maxWidth: geo.size.width, maxHeight: geo.size.height)
             }
+            // Allow TabView page swipe to work when not zoomed
+            .scrollDisabled(!isZoomed)
             .frame(width: geo.size.width, height: geo.size.height)
             .background(Color.black)
         }
@@ -145,4 +468,50 @@ struct ZoomableAsyncImage: View {
     }
 
     private func clamp(_ v: CGFloat) -> CGFloat { min(max(v, 1), 4) }
+}
+
+private struct AltTextOverlay: View {
+    let text: String?
+
+    var body: some View {
+        VStack(spacing: 12) {
+            // grabber
+            Capsule()
+                .fill(Color.white.opacity(0.35))
+                .frame(width: 36, height: 4)
+                .padding(.top, 4)
+
+            HStack {
+                Text("Alt Text")
+                    .font(.headline)
+                    .foregroundStyle(.white.opacity(0.95))
+                Spacer()
+            }
+
+            ScrollView {
+                Text(displayText)
+                    .font(.body)
+                    .foregroundStyle(.white.opacity(0.95))
+                    .lineSpacing(2)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 220)
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(.ultraThinMaterial)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+        )
+        .shadow(radius: 8)
+    }
+
+    private var displayText: String {
+        let trimmed = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "No alt text provided." : trimmed
+    }
 }

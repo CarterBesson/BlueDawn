@@ -9,15 +9,19 @@ struct MastodonLoginView: View {
         Form {
             Section("Instance") {
                 TextField("mastodon.social", text: $instanceDomain)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
                     .textContentType(.URL)
                     .keyboardType(.URL)
+#endif
             }
             Section("Authentication") {
                 SecureField("Personal access token", text: $mastodonToken)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
+#if canImport(UIKit)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+#endif
                 Button("Sign in to Mastodon", action: { Task { await signIn() } })
                     .buttonStyle(.borderedProminent)
                     .disabled(instanceDomain.isEmpty || mastodonToken.isEmpty)

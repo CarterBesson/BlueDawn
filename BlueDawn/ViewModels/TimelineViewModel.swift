@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 
+
 @MainActor
 @Observable
 final class TimelineViewModel {
@@ -12,8 +13,9 @@ final class TimelineViewModel {
     }
 
     // UI state (plain vars; @Observable tracks mutations)
+    // `posts` is the filtered view of `allPosts`, kept in a stable order.
     private(set) var posts: [UnifiedPost] = []
-    var filter: Filter = .all { didSet { applyFilter() } }
+    var filter: Filter = .all { didSet { Task { await applyFilterAsync() } } }
 
     enum CanonicalPreference: String, CaseIterable { case newest, oldest, blueskyFirst, mastodonFirst }
     var canonicalPreference: CanonicalPreference = .newest
@@ -25,11 +27,28 @@ final class TimelineViewModel {
     // Dependencies
     private let session: SessionStore
 
-    // Per-service caches + cursors
-    private var mastodonPosts: [UnifiedPost] = []
-    private var blueskyPosts: [UnifiedPost] = []
-    private var mastodonCursor: String? = nil
-    private var blueskyCursor: String? = nil
+    // Persisted unified store (newest → oldest). Never resort wholesale; insert incrementally.
+    private var allPosts: [UnifiedPost] = []
+    private var idSet: Set<String> = []
+
+    // Cached filtered results for performance
+    private var cachedAllPosts: [UnifiedPost] = []
+    private var cachedBlueskyPosts: [UnifiedPost] = []
+    private var cachedMastodonPosts: [UnifiedPost] = []
+    private var filterCacheValid = false
+
+
+    // Pagination anchors
+    private var mastodonBottomCursor: String? = nil // for older pages (max_id)
+    private var blueskyBottomCursor: String? = nil  // for older pages (cursor)
+    private var mastodonNewestID: String? = nil     // for newer pages (since_id)
+    private var currentAnchorID: String? = nil      // last visible item id to preserve position across sessions
+
+    // Retention / compaction settings
+    private let retentionMaxCount = 1400
+    private let retentionHighWater = 1650
+    private let retentionAgeDays: Int = 30
+    private let retentionAnchorBuffer = 120
 
     init(session: SessionStore) {
         self.session = session
@@ -37,51 +56,116 @@ final class TimelineViewModel {
 
     // MARK: - Public API used by the view
 
+    /// Incrementally fetches new items above the current top without reloading/reshuffling existing items.
     func refresh() async {
         if isLoading { return }
         isLoading = true
         error = nil
         defer { isLoading = false }
 
-        func fetchMastodonWrapper() async -> Result<([UnifiedPost], String?), Error> {
-            do { return .success(try await snapshotMastodon(resetCursor: true)) }
-            catch { return .failure(error) }
+        @Sendable func fetchMastodonNew() async -> Result<(newPosts: [UnifiedPost], newestID: String?), Error> {
+            guard let client = session.mastodonClient else { return .success(([], mastodonNewestID)) }
+            do {
+                let sinceID = mastodonNewestID ?? topMastodonID()
+                if let sinceID {
+                    let new = try await client.fetchHomeTimelineSince(sinceID: sinceID)
+                    let newest = new.first.flatMap { Self.extractMastodonID(from: $0.id) } ?? sinceID
+                    return .success((new, newest))
+                } else {
+                    let (page, _) = try await client.fetchHomeTimeline(cursor: nil)
+                    return .success((page, page.first.flatMap { Self.extractMastodonID(from: $0.id) }))
+                }
+            } catch { return .failure(error) }
         }
 
-        func fetchBlueskyWrapper() async -> Result<([UnifiedPost], String?), Error> {
-            do { return .success(try await snapshotBluesky(resetCursor: true)) }
-            catch { return .failure(error) }
-        }
-
-        let mResult = await fetchMastodonWrapper()
-        var bResult = await fetchBlueskyWrapper()
-
-        if case .failure(let bError) = bResult,
-           case BlueskyClient.APIError.badStatus(let code, _) = bError, code == 401 {
-            if await session.refreshBlueskyIfNeeded() {
-                bResult = await fetchBlueskyWrapper()
-            } else {
-                session.signOutBluesky()
+        @Sendable func fetchBlueskyNew() async -> Result<(newPosts: [UnifiedPost], nextCursor: String?), Error> {
+            guard let client = session.blueskyClient else { return .success(([], blueskyBottomCursor)) }
+            do {
+                var collected: [UnifiedPost] = []
+                var cursor: String? = nil
+                var pages = 0
+                let maxPages = 4
+                var stop = false
+                while !stop {
+                    let (batch, next) = try await client.fetchHomeTimeline(cursor: cursor)
+                    for p in batch {
+                        if idSet.contains(p.id) { stop = true; break }
+                        collected.append(p)
+                    }
+                    cursor = next
+                    pages += 1
+                    if stop || cursor == nil || pages >= maxPages { break }
+                }
+                return .success((collected, blueskyBottomCursor))
+            } catch {
+                if case BlueskyClient.APIError.badStatus(let code, _) = error, code == 401 {
+                    if await session.refreshBlueskyIfNeeded(), let client2 = session.blueskyClient {
+                        do {
+                            var collected: [UnifiedPost] = []
+                            var cursor: String? = nil
+                            var pages = 0
+                            let maxPages = 4
+                            var stop = false
+                            while !stop {
+                                let (batch, next) = try await client2.fetchHomeTimeline(cursor: cursor)
+                                for p in batch {
+                                    if idSet.contains(p.id) { stop = true; break }
+                                    collected.append(p)
+                                }
+                                cursor = next
+                                pages += 1
+                                if stop || cursor == nil || pages >= maxPages { break }
+                            }
+                            return .success((collected, blueskyBottomCursor))
+                        } catch {
+                            session.signOutBluesky()
+                            return .failure(error)
+                        }
+                    } else {
+                        session.signOutBluesky()
+                        return .failure(error)
+                    }
+                }
+                return .failure(error)
             }
         }
 
-        var nextMPosts = mastodonPosts
-        var nextMCur = mastodonCursor
-        var nextBPosts = blueskyPosts
-        var nextBCur = blueskyCursor
+        async let mastodonTask = fetchMastodonNew()
+        async let blueskyTask = fetchBlueskyNew()
 
-        if case .success(let r) = mResult { nextMPosts = r.0; nextMCur = r.1 }
-        if case .success(let r) = bResult { nextBPosts = r.0; nextBCur = r.1 }
+        let mResult = await mastodonTask
+        let bResult = await blueskyTask
 
-        mastodonPosts = nextMPosts
-        mastodonCursor = nextMCur
-        blueskyPosts = nextBPosts
-        blueskyCursor = nextBCur
+        // Merge incremental results and sort by creation time
+        var newPosts: [UnifiedPost] = []
+        if case .success(let (mNew, newestID)) = mResult {
+            if let newestID { mastodonNewestID = newestID }
+            newPosts.append(contentsOf: mNew)
+        }
+        if case .success(let (bNew, _)) = bResult {
+            newPosts.append(contentsOf: bNew)
+        }
 
-        applyFilter()
+        // Sort all new posts by creation time (newest first) to create proper interleaved timeline
+        newPosts.sort { $0.createdAt > $1.createdAt }
 
-        if case .failure = mResult, case .failure(let bErr) = bResult {
-            self.error = (bErr as? LocalizedError)?.errorDescription ?? bErr.localizedDescription
+        if !newPosts.isEmpty {
+            await processAndInsertNewPosts(newPosts)
+        }
+
+        // Surface an error if either provider failed, with source labels
+        var messages: [String] = []
+        if case .failure(let mErr) = mResult {
+            let msg = (mErr as? LocalizedError)?.errorDescription ?? mErr.localizedDescription
+            messages.append("Mastodon: \(msg)")
+        }
+        if case .failure(let bErr) = bResult {
+            let msg = (bErr as? LocalizedError)?.errorDescription ?? bErr.localizedDescription
+            messages.append("Bluesky: \(msg)")
+        }
+        if !messages.isEmpty {
+            self.error = messages.joined(separator: "\n")
+            print("[Timeline] refresh errors ->\n\(self.error!)")
         }
     }
 
@@ -97,92 +181,217 @@ final class TimelineViewModel {
         error = nil
         defer { isLoadingMore = false }
 
-        func fetchMastodonWrapper() async -> Result<([UnifiedPost], String?), Error> {
-            do { return .success(try await snapshotMastodon(resetCursor: false)) }
-            catch { return .failure(error) }
-        }
+        var fetched: [UnifiedPost] = []
 
-        func fetchBlueskyWrapper() async -> Result<([UnifiedPost], String?), Error> {
-            do { return .success(try await snapshotBluesky(resetCursor: false)) }
-            catch { return .failure(error) }
-        }
-
-        let mResult = await fetchMastodonWrapper()
-        var bResult = await fetchBlueskyWrapper()
-
-        if case .failure(let bError) = bResult,
-           case BlueskyClient.APIError.badStatus(let code, _) = bError, code == 401 {
-            if await session.refreshBlueskyIfNeeded() {
-                bResult = await fetchBlueskyWrapper()
-            } else {
-                session.signOutBluesky()
+        // Older Mastodon page using max_id
+        if let client = session.mastodonClient {
+            do {
+                let (page, next) = try await client.fetchHomeTimeline(cursor: mastodonBottomCursor)
+                mastodonBottomCursor = next ?? mastodonBottomCursor
+                fetched.append(contentsOf: page)
+            } catch {
+                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                self.error = "Mastodon: \(msg)"
+                print("[Timeline] loadMore mastodon error: \(msg)")
             }
         }
 
-        var nextMPosts = mastodonPosts
-        var nextMCur = mastodonCursor
-        var nextBPosts = blueskyPosts
-        var nextBCur = blueskyCursor
+        // Older Bluesky page using cursor
+        if let client = session.blueskyClient {
+            do {
+                let (page, next) = try await client.fetchHomeTimeline(cursor: blueskyBottomCursor)
+                blueskyBottomCursor = next ?? blueskyBottomCursor
+                fetched.append(contentsOf: page)
+            } catch {
+                if case BlueskyClient.APIError.badStatus(let code, _) = error, code == 401 {
+                    if await session.refreshBlueskyIfNeeded(), let client2 = session.blueskyClient,
+                       let (page, next) = try? await client2.fetchHomeTimeline(cursor: blueskyBottomCursor) {
+                        blueskyBottomCursor = next ?? blueskyBottomCursor
+                        fetched.append(contentsOf: page)
+                    } else { session.signOutBluesky() }
+                    let msg = (error as? LocalizedError)?.errorDescription ?? "Unauthorized"
+                    self.error = "Bluesky: \(msg)"
+                    print("[Timeline] loadMore bluesky 401/error: \(msg)")
+                } else {
+                    let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.error = "Bluesky: \(msg)"
+                    print("[Timeline] loadMore bluesky error: \(msg)")
+                }
+            }
+        }
 
-        if case .success(let r) = mResult { nextMPosts = r.0; nextMCur = r.1 }
-        if case .success(let r) = bResult { nextBPosts = r.0; nextBCur = r.1 }
-
-        mastodonPosts = nextMPosts
-        mastodonCursor = nextMCur
-        blueskyPosts = nextBPosts
-        blueskyCursor = nextBCur
-
-        applyFilter()
-
-        if case .failure = mResult, case .failure(let bErr) = bResult {
-            self.error = (bErr as? LocalizedError)?.errorDescription ?? bErr.localizedDescription
+        if !fetched.isEmpty {
+            // Sort older posts by creation time (newest first) for proper interleaving
+            fetched.sort { $0.createdAt > $1.createdAt }
+            await processAndInsertOlderPosts(fetched)
         }
     }
 
-    // MARK: - Internal fetches
-
-    private func fetchMastodon(resetCursor: Bool) async throws {
-        guard let client = session.mastodonClient else { return }
-        if resetCursor { mastodonCursor = nil; mastodonPosts.removeAll() }
-        let (newPosts, next) = try await client.fetchHomeTimeline(cursor: mastodonCursor)
-        mastodonCursor = next
-        mastodonPosts.append(contentsOf: newPosts)
+    // MARK: - Persistence
+    func loadPersisted() async -> String? {
+        if let saved = TimelinePersistence.load() {
+            let deduped = Normalizer.dedupe(saved.posts)
+            allPosts = deduped
+            idSet = Set(deduped.map { $0.id })
+            mastodonBottomCursor = saved.meta.mastodonBottomCursor
+            blueskyBottomCursor = saved.meta.blueskyBottomCursor
+            mastodonNewestID = saved.meta.mastodonNewestID
+            currentAnchorID = saved.meta.anchorPostID
+            let didTrim = compactIfNeeded(anchorID: saved.meta.anchorPostID)
+            if deduped.count != saved.posts.count || didTrim {
+                persist(anchorID: saved.meta.anchorPostID)
+            }
+            await applyFilterAsync()
+            return saved.meta.anchorPostID
+        }
+        await applyFilterAsync()
+        return nil
     }
 
-    private func fetchBluesky(resetCursor: Bool) async throws {
-        guard let client = session.blueskyClient else { return }
-        if resetCursor { blueskyCursor = nil; blueskyPosts.removeAll() }
-        let (newPosts, next) = try await client.fetchHomeTimeline(cursor: blueskyCursor)
-        blueskyCursor = next
-        blueskyPosts.append(contentsOf: newPosts)
+    func updateAnchorPostID(_ id: String?) {
+        currentAnchorID = id
+        persist()
     }
 
-    // Snapshot fetchers: build the post array without mutating state, so we can swap atomically.
-    private func snapshotMastodon(resetCursor: Bool) async throws -> ([UnifiedPost], String?) {
-        guard let client = session.mastodonClient else { return (mastodonPosts, mastodonCursor) }
-        let startCursor = resetCursor ? nil : mastodonCursor
-        let base = resetCursor ? [] : mastodonPosts
-        let (newPosts, next) = try await client.fetchHomeTimeline(cursor: startCursor)
-        return (base + newPosts, next)
+    func debugClearAndReload() async {
+        // Clear all cached data
+        allPosts.removeAll()
+        idSet.removeAll()
+        posts.removeAll()
+
+        // Reset pagination cursors
+        mastodonBottomCursor = nil
+        blueskyBottomCursor = nil
+        mastodonNewestID = nil
+        currentAnchorID = nil
+
+        // Clear cached filters
+        invalidateFilterCache()
+
+        // Load fresh data
+        await refresh()
     }
 
-    private func snapshotBluesky(resetCursor: Bool) async throws -> ([UnifiedPost], String?) {
-        guard let client = session.blueskyClient else { return (blueskyPosts, blueskyCursor) }
-        let startCursor = resetCursor ? nil : blueskyCursor
-        let base = resetCursor ? [] : blueskyPosts
-        let (newPosts, next) = try await client.fetchHomeTimeline(cursor: startCursor)
-        return (base + newPosts, next)
+    private func persist(anchorID: String? = nil) {
+        let anchor = anchorID ?? currentAnchorID
+        // Compact before saving to bound storage
+        let didCompact = compactIfNeeded(anchorID: anchor)
+        if didCompact { Task { await applyFilterAsync() } }
+        let meta = TimelineMeta(
+            mastodonBottomCursor: mastodonBottomCursor,
+            blueskyBottomCursor: blueskyBottomCursor,
+            mastodonNewestID: mastodonNewestID,
+            anchorPostID: anchor,
+            lastSaved: Date()
+        )
+        TimelinePersistence.save(posts: allPosts, meta: meta)
     }
 
-    private func applyFilter() {
+    // Trim oldest items to keep the file small and startup fast, preserving anchor and recent items.
+    // Strategy: if count > high water, trim to maxCount; always keep items newer than age window; protect ±buffer around anchor.
+    private func compactIfNeeded(anchorID: String?) -> Bool {
+        let count = allPosts.count
+        if count <= retentionHighWater { return false }
+
+        let cutoff = Calendar.current.date(byAdding: .day, value: -retentionAgeDays, to: Date()) ?? Date.distantPast
+        var keep = Array(repeating: false, count: count)
+
+        // Decide base policy: keep last N or keep last X days (whichever is smaller)
+        let head = min(retentionMaxCount, count)
+        let ageCount = allPosts.prefix { $0.createdAt >= cutoff }.count
+        let useAge = ageCount > 0 && ageCount < head
+        if useAge {
+            // Keep all posts newer than cutoff
+            for (i, p) in allPosts.enumerated() where p.createdAt >= cutoff { keep[i] = true }
+        } else {
+            // Keep recent head up to retentionMaxCount
+            if head > 0 { for i in 0..<head { keep[i] = true } }
+        }
+
+        // Protect around anchor
+        if let anchorID, let idx = allPosts.firstIndex(where: { $0.id == anchorID }) {
+            let start = max(0, idx - retentionAnchorBuffer)
+            let end = min(count - 1, idx + retentionAnchorBuffer)
+            if start <= end { for i in start...end { keep[i] = true } }
+        }
+
+        // If we wouldn't trim anything, bail
+        if !keep.contains(false) { return false }
+
+        // Build trimmed list
+        var trimmed: [UnifiedPost] = []
+        trimmed.reserveCapacity(min(count, retentionMaxCount + (retentionAnchorBuffer * 2) + 512))
+        for (i, p) in allPosts.enumerated() where keep[i] { trimmed.append(p) }
+
+        // Only commit if it actually reduces size significantly (to avoid churning)
+        if trimmed.count >= allPosts.count { return false }
+        allPosts = trimmed
+        idSet = Set(allPosts.map { $0.id })
+        invalidateFilterCache()
+        return true
+    }
+
+    // MARK: - Background Processing
+
+    private func processAndInsertNewPosts(_ newPosts: [UnifiedPost]) async {
+        // For now, skip heavy processing and just insert directly
+        // This maintains the performance improvement from cached filtering
+        insertNewAtTop(newPosts)
+        invalidateFilterCache()
+        await applyFilterAsync()
+        persist()
+    }
+
+    private func processAndInsertOlderPosts(_ olderPosts: [UnifiedPost]) async {
+        // For now, skip heavy processing and just insert directly
+        // This maintains the performance improvement from cached filtering
+        insertOlderInOrder(olderPosts)
+        invalidateFilterCache()
+        await applyFilterAsync()
+        persist()
+    }
+
+    private func invalidateFilterCache() {
+        filterCacheValid = false
+    }
+
+    private func applyFilterAsync() async {
+        // Use cached results if available and valid
+        if filterCacheValid {
+            switch filter {
+            case .all:
+                posts = cachedAllPosts
+            case .bluesky:
+                posts = cachedBlueskyPosts
+            case .mastodon:
+                posts = cachedMastodonPosts
+            }
+            return
+        }
+
+        // Process filtering in background
+        let allPostsCopy = allPosts
+        let (allFiltered, blueskyFiltered, mastodonFiltered) = await Task.detached {
+            let bluesky = allPostsCopy.filter { if case .bluesky = $0.network { return true } else { return false } }
+            let mastodon = allPostsCopy.filter { if case .mastodon = $0.network { return true } else { return false } }
+
+            return (allPostsCopy, bluesky, mastodon)
+        }.value
+
+        // Update cache
+        cachedAllPosts = allFiltered
+        cachedBlueskyPosts = blueskyFiltered
+        cachedMastodonPosts = mastodonFiltered
+        filterCacheValid = true
+
+        // Apply current filter
         switch filter {
         case .all:
-            let merged = mastodonPosts + blueskyPosts
-            posts = groupIntoThreads(dedupeCrossPosts(merged, preference: canonicalPreference))
+            posts = allFiltered
         case .bluesky:
-            posts = groupIntoThreads(blueskyPosts.sorted { $0.createdAt > $1.createdAt })
+            posts = blueskyFiltered
         case .mastodon:
-            posts = groupIntoThreads(mastodonPosts.sorted { $0.createdAt > $1.createdAt })
+            posts = mastodonFiltered
         }
     }
 
@@ -410,11 +619,13 @@ final class TimelineViewModel {
     }
 
     // MARK: - Cross-post de-duplication
-    private let crossPostWindow: TimeInterval = 30 * 60 // 30 minutes
+    // Expand window to better catch delayed cross-posts across services
+    private let crossPostWindow: TimeInterval = 6 * 60 * 60 // 6 hours
+
 
     private func dedupeCrossPosts(_ all: [UnifiedPost],
                                   preference: CanonicalPreference) -> [UnifiedPost] {
-        // Group by a conservative signature: author + normalized text + media hint
+        // Group by a conservative signature: author local handle + normalized text + media hint
         var buckets: [String: [UnifiedPost]] = [:]
         for p in all {
             let key = crossSignature(for: p)
@@ -425,6 +636,9 @@ final class TimelineViewModel {
         for (_, group) in buckets {
             // Sort by time and create clusters within the window
             let sorted = group.sorted { $0.createdAt < $1.createdAt }
+            // Use a shorter window for link-only bodies to avoid over-merging
+            let bodyForWindow = normalizeBody(sorted.first?.text ?? AttributedString(""))
+            let window = bodyForWindow.isEmpty ? min(crossPostWindow, 90 * 60) : crossPostWindow
             var cluster: [UnifiedPost] = []
             var anchor: UnifiedPost?
 
@@ -437,7 +651,7 @@ final class TimelineViewModel {
 
             for post in sorted {
                 if let a = anchor {
-                    if abs(post.createdAt.timeIntervalSince(a.createdAt)) <= crossPostWindow {
+                    if abs(post.createdAt.timeIntervalSince(a.createdAt)) <= window {
                         cluster.append(post)
                     } else {
                         flushCluster()
@@ -457,18 +671,28 @@ final class TimelineViewModel {
     private func selectCanonical(from cluster: [UnifiedPost],
                                  preference: CanonicalPreference) -> UnifiedPost {
         guard cluster.count > 1 else { return cluster[0] }
+
+        // First, prefer posts that have media (any posts with non-empty media arrays)
+        let postsWithMedia = cluster.filter { !$0.media.isEmpty }
+
+        // If we have posts with media, prefer those; otherwise use all posts
+        let withValidMedia = postsWithMedia.isEmpty ? cluster : postsWithMedia
+
+        // If some posts have valid media and others don't, prefer those with valid media
+        let candidates = withValidMedia.isEmpty ? cluster : withValidMedia
+
         let pick: UnifiedPost = {
             switch preference {
             case .blueskyFirst:
-                return cluster.first(where: { if case .bluesky = $0.network { return true } else { return false } })
-                    ?? cluster.max(by: { $0.createdAt < $1.createdAt })!
+                return candidates.first(where: { if case .bluesky = $0.network { return true } else { return false } })
+                    ?? candidates.max(by: { $0.createdAt < $1.createdAt })!
             case .mastodonFirst:
-                return cluster.first(where: { if case .mastodon = $0.network { return true } else { return false } })
-                    ?? cluster.max(by: { $0.createdAt < $1.createdAt })!
+                return candidates.first(where: { if case .mastodon = $0.network { return true } else { return false } })
+                    ?? candidates.max(by: { $0.createdAt < $1.createdAt })!
             case .newest:
-                return cluster.max(by: { $0.createdAt < $1.createdAt })!
+                return candidates.max(by: { $0.createdAt < $1.createdAt })!
             case .oldest:
-                return cluster.min(by: { $0.createdAt < $1.createdAt })!
+                return candidates.min(by: { $0.createdAt < $1.createdAt })!
             }
         }()
 
@@ -484,10 +708,24 @@ final class TimelineViewModel {
     }
 
     private func crossSignature(for p: UnifiedPost) -> String {
-        let author = normalizeAuthor(p)
+        let author = authorKey(p)
         let body   = normalizeBody(p.text)
         let mediaCount = p.media.count // robust across services (ignores differing CDN filenames)
         return "\(author)|\(body)|n\(mediaCount)"
+    }
+
+    // Try to map an author's handle across services to a stable local username
+    private func authorKey(_ p: UnifiedPost) -> String {
+        let handle = p.authorHandle.lowercased()
+        var local = handle
+        if let atIndex = handle.firstIndex(of: "@") {
+            // Mastodon: acct may be "user" or "user@instance" → take local part
+            local = String(handle[..<atIndex])
+        } else if handle.contains(".") {
+            // Bluesky: handle like "user.bsky.social" → take first label
+            local = String(handle.split(separator: ".").first ?? Substring(handle))
+        }
+        return local.replacingOccurrences(of: #"[^\p{L}\p{N}]"#, with: "", options: .regularExpression)
     }
 
     private func normalizeAuthor(_ p: UnifiedPost) -> String {
@@ -499,7 +737,10 @@ final class TimelineViewModel {
 
     private func normalizeBody(_ a: AttributedString) -> String {
         var s = String(a.characters).lowercased()
+        // Strip links entirely so shortened vs full URLs match
         s = s.replacingOccurrences(of: #"https?://\S+"#, with: "", options: .regularExpression)
+        // Remove any common URL-like tokens that might slip through (e.g., www.example.com)
+        s = s.replacingOccurrences(of: #"\b(?:www\.)?[-a-z0-9@:%._+~#=]{2,256}\.[a-z]{2,63}\b[^\s]*"#, with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: #"(?<!\w)[@#][\p{L}0-9_.-]+"#, with: "", options: .regularExpression)
         s = s.replacingOccurrences(of: #"[^\p{L}\p{N}\s]"#, with: " ", options: .regularExpression)
         s = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
@@ -513,22 +754,109 @@ final class TimelineViewModel {
 
     // MARK: - Restore helpers
     func ensureContains(postID: String, maxPages: Int = 6) async {
-        // If already present in either cache, nothing to do
-        if hasPost(id: postID) { return }
+        if idSet.contains(postID) { return }
         var pages = 0
         while pages < maxPages {
             await loadMore()
-            if hasPost(id: postID) { return }
-            // If both cursors are exhausted, stop
-            if mastodonCursor == nil && blueskyCursor == nil { break }
+            if idSet.contains(postID) { return }
+            if mastodonBottomCursor == nil && blueskyBottomCursor == nil { break }
             pages += 1
         }
     }
 
-    private func hasPost(id: String) -> Bool {
-        if mastodonPosts.contains(where: { $0.id == id }) { return true }
-        if blueskyPosts.contains(where: { $0.id == id }) { return true }
-        if posts.contains(where: { $0.id == id }) { return true }
+    // MARK: - Insertion helpers (stable ordering)
+    private func insertNewAtTop(_ batch: [UnifiedPost]) {
+        guard !batch.isEmpty else { return }
+        // Filter out duplicates by id and cross-post signature
+        let filtered = batch.filter { p in
+            guard !idSet.contains(p.id) else { return false }
+            return !isCrossDuplicate(of: p)
+        }
+        guard !filtered.isEmpty else { return }
+        allPosts.insert(contentsOf: filtered, at: 0)
+        for p in filtered { idSet.insert(p.id) }
+        invalidateFilterCache()
+    }
+
+    private func insertOlderInOrder(_ batch: [UnifiedPost]) {
+        var didInsert = false
+        for p in batch {
+            if idSet.contains(p.id) { continue }
+            if isCrossDuplicate(of: p) { continue }
+            let idx = insertionIndex(for: p)
+            allPosts.insert(p, at: idx)
+            idSet.insert(p.id)
+            didInsert = true
+        }
+        if didInsert {
+            invalidateFilterCache()
+        }
+    }
+
+    // Binary search by createdAt (newest → oldest)
+    private func insertionIndex(for p: UnifiedPost) -> Int {
+        var low = 0
+        var high = allPosts.count
+        while low < high {
+            let mid = (low + high) / 2
+            let m = allPosts[mid]
+            if p.createdAt > m.createdAt {
+                high = mid
+            } else if p.createdAt < m.createdAt {
+                low = mid + 1
+            } else {
+                // Stable tie-breaker on id
+                if p.id < m.id { high = mid } else { low = mid + 1 }
+            }
+        }
+        return low
+    }
+
+    private func isCrossDuplicate(of p: UnifiedPost) -> Bool {
+        // Use the same signature + time window as the batch de-duper to detect duplicates among existing posts
+        let sig = crossSignature(for: p)
+        // Scan a narrow window around where this would be inserted
+        let window: TimeInterval = crossPostWindow
+        // Find neighbors within time window
+        let idx = insertionIndex(for: p)
+        var i = idx
+        while i > 0 {
+            i -= 1
+            let q = allPosts[i]
+            if abs(q.createdAt.timeIntervalSince(p.createdAt)) > window { break }
+            if crossSignature(for: q) == sig {
+                // Update alternates if helpful
+                var existing = allPosts[i]
+                var alts = existing.crossPostAlternates ?? [:]
+                if alts[p.network] == nil { alts[p.network] = p.id; existing.crossPostAlternates = alts; allPosts[i] = existing }
+                return true
+            }
+        }
+        var j = idx
+        while j < allPosts.count {
+            let q = allPosts[j]
+            if abs(q.createdAt.timeIntervalSince(p.createdAt)) > window { break }
+            if crossSignature(for: q) == sig {
+                var existing = allPosts[j]
+                var alts = existing.crossPostAlternates ?? [:]
+                if alts[p.network] == nil { alts[p.network] = p.id; existing.crossPostAlternates = alts; allPosts[j] = existing }
+                return true
+            }
+            j += 1
+        }
         return false
+    }
+
+    private func topMastodonID() -> String? {
+        for p in allPosts {
+            if case .mastodon = p.network, let id = Self.extractMastodonID(from: p.id) { return id }
+        }
+        return nil
+    }
+
+    private static func extractMastodonID(from unifiedID: String) -> String? {
+        // unified id format: "mastodon:<id>"
+        guard let idx = unifiedID.firstIndex(of: ":") else { return nil }
+        return String(unifiedID[unifiedID.index(after: idx)...])
     }
 }

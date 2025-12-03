@@ -9,6 +9,9 @@ struct ProfileView: View {
     @State private var postSelection: UnifiedPost? = nil
     @State private var imageViewer: ImageViewerState? = nil
     @State private var isFollowing: Bool = false
+    @State private var isTogglingFollow: Bool = false
+    @State private var safariURL: URL? = nil
+    @State private var toastText: String? = nil
     private struct ProfileTarget: Identifiable { let id = UUID(); let network: Network; let handle: String }
 
     init(network: Network, handle: String, session: SessionStore) {
@@ -30,6 +33,9 @@ struct ProfileView: View {
                     onOpenProfile: { network, handle in
                         profileTarget = ProfileTarget(network: network, handle: handle)
                         pushProfile = true
+                    },
+                    onOpenPost: { opened in
+                        postSelection = opened
                     },
                     onTapImage: { tappedPost, idx in
                         imageViewer = ImageViewerState(post: tappedPost, index: idx)
@@ -60,10 +66,24 @@ struct ProfileView: View {
             }
             if let scheme = url.scheme, (scheme == "http" || scheme == "https"), let host = url.host {
                 let path = url.path
+                if let statusID = extractMastoStatusID(fromPath: path) {
+                    Task { await openMastodonStatus(host: host, id: statusID, url: url) }
+                    return .handled
+                }
                 if path.hasPrefix("/@") {
                     let username = String(path.dropFirst(2))
-                    let handle = "\(username)@\(host)"
-                    profileTarget = ProfileTarget(network: .mastodon(instance: host), handle: handle); pushProfile = true
+                    profileTarget = ProfileTarget(network: .mastodon(instance: host), handle: username); pushProfile = true
+                    return .handled
+                }
+                if path.hasPrefix("/users/") {
+                    let comps = path.split(separator: "/").map(String.init)
+                    if comps.count >= 2 {
+                        profileTarget = ProfileTarget(network: .mastodon(instance: host), handle: comps[1]); pushProfile = true
+                        return .handled
+                    }
+                }
+                if let statusID = extractMastoStatusID(fromPath: path) {
+                    Task { await openMastodonStatus(host: host, id: statusID, url: url) }
                     return .handled
                 }
                 if host == "bsky.app" && path.hasPrefix("/profile/") {
@@ -71,11 +91,23 @@ struct ProfileView: View {
                     profileTarget = ProfileTarget(network: .bluesky, handle: handle); pushProfile = true
                     return .handled
                 }
+                // Non-profile web links
+                if session.openLinksInApp {
+                    #if canImport(SafariServices) && canImport(UIKit)
+                    safariURL = url
+                    return .handled
+                    #else
+                    return .systemAction
+                    #endif
+                }
             }
             return .systemAction
         })
         .navigationBarTitleDisplayMode(.inline)
-        .task { await viewModel.load() }
+        .task {
+            await viewModel.load()
+            if let u = viewModel.user, let f = u.isFollowing { isFollowing = f }
+        }
         .alert("Error", isPresented: .constant(viewModel.error != nil)) {
             Button("OK") { viewModel.error = nil }
         } message: { Text(viewModel.error ?? "") }
@@ -94,8 +126,53 @@ struct ProfileView: View {
         .fullScreenCover(item: $imageViewer) { (selection: ImageViewerState) in
             ImageViewer(post: selection.post, startIndex: selection.index)
         }
+        #if canImport(SafariServices)
+        .sheet(isPresented: Binding(get: { safariURL != nil }, set: { if !$0 { safariURL = nil } })) {
+            if let url = safariURL { SafariView(url: url) }
+        }
+        #endif
+        .overlay(alignment: .bottom) {
+            if let t = toastText {
+                Text(t)
+                    .font(.footnote)
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .padding(.bottom, 20)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
     }
 
+    private func extractMastoStatusID(fromPath path: String) -> String? {
+        let comps = path.split(separator: "/").map(String.init)
+        if comps.count >= 2, comps[0].hasPrefix("@") {
+            let last = comps.last!
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: last)) { return last }
+        }
+        if let idx = comps.firstIndex(of: "statuses"), idx + 1 < comps.count {
+            let cand = comps[idx + 1]
+            if CharacterSet.decimalDigits.isSuperset(of: CharacterSet(charactersIn: cand)) { return cand }
+        }
+        return nil
+    }
+
+    @MainActor
+    private func openMastodonStatus(host: String, id: String, url: URL) async {
+        let client: MastodonClient
+        if let c = session.mastodonClient, c.baseURL.host == host { client = c }
+        else if let base = URL(string: "https://\(host)") { client = MastodonClient(baseURL: base, accessToken: "") }
+        else { return }
+        if let post = try? await client.fetchStatus(id: id) {
+            postSelection = post
+            return
+        }
+        // Fallback to SafariView if enabled
+        #if canImport(SafariServices) && canImport(UIKit)
+        if session.openLinksInApp { safariURL = url }
+        #endif
+    }
     @ViewBuilder
     private func header(user u: UnifiedUser) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -126,15 +203,22 @@ struct ProfileView: View {
                 }
                 Spacer()
 
-                Button {
-                    // UI-only toggle for now
-                    isFollowing.toggle()
-                } label: {
-                    Text(isFollowing ? "Following" : "Follow")
+                if hasKnownFollowState(u) && canFollow(u) && !isViewingSelf(u) {
+                    Button {
+                        Task { await handleToggleFollow(u) }
+                    } label: {
+                        HStack(spacing: 6) {
+                            if isTogglingFollow {
+                                ProgressView().controlSize(.small)
+                            }
+                            Text(isFollowing ? "Following" : "Follow")
+                        }
+                    }
+                    .disabled(isTogglingFollow)
+                    .applyFollowButtonStyle(isFollowing: isFollowing)
+                    .controlSize(.regular)
+                    .accessibilityLabel(isFollowing ? "Following \(u.displayName ?? u.handle)" : "Follow \(u.displayName ?? u.handle)")
                 }
-                .applyFollowButtonStyle(isFollowing: isFollowing)
-                .controlSize(.regular)
-                .accessibilityLabel(isFollowing ? "Following \(u.displayName ?? u.handle)" : "Follow \(u.displayName ?? u.handle)")
             }
 
             if let bio = u.bio, !bio.characters.isEmpty {
@@ -171,5 +255,99 @@ private extension View {
         #else
         self.buttonStyle(DefaultButtonStyle())
         #endif
+    }
+}
+
+extension ProfileView {
+    @MainActor
+    private func handleToggleFollow(_ u: UnifiedUser) async {
+        guard !isTogglingFollow else { return }
+        guard canFollow(u) else { return }
+        isTogglingFollow = true
+        defer { isTogglingFollow = false }
+        let currentlyFollowing = isFollowing
+        // Optimistic update
+        withAnimation { isFollowing.toggle() }
+        do {
+            switch u.network {
+            case .bluesky:
+                guard let client = await session.blueskyClientEnsuringFreshToken() else { throw URLError(.userAuthenticationRequired) }
+                if currentlyFollowing {
+                    if let rkey = viewModel.user?.bskyFollowRkey { try await client.unfollowUser(rkey: rkey) }
+                    viewModel.user?.isFollowing = false
+                    viewModel.user?.bskyFollowRkey = nil
+                    showToast("Unfollowed @\(u.handle)")
+                    Haptics.selection()
+                } else {
+                    // Extract DID from UnifiedUser.id ("bsky:<did>")
+                    let did = u.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+                    let rkey = try await client.followUser(did: did)
+                    viewModel.user?.isFollowing = true
+                    viewModel.user?.bskyFollowRkey = rkey
+                    showToast("Followed @\(u.handle)")
+                    Haptics.selection()
+                }
+            case .mastodon(let instance):
+                // Only allow follow if authed client matches this instance
+                if let client = session.mastodonClient, client.baseURL.host == instance {
+                    // Extract account ID from UnifiedUser.id ("mastodon:<id>")
+                    let id = u.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
+                    if currentlyFollowing {
+                        try await client.unfollowUser(id: id); viewModel.user?.isFollowing = false
+                        showToast("Unfollowed @\(u.handle)"); Haptics.selection()
+                    } else {
+                        try await client.followUser(id: id); viewModel.user?.isFollowing = true
+                        showToast("Followed @\(u.handle)"); Haptics.selection()
+                    }
+                } else {
+                    throw URLError(.userAuthenticationRequired)
+                }
+            }
+        } catch {
+            // Revert on failure
+            withAnimation { isFollowing = currentlyFollowing }
+            viewModel.error = error.localizedDescription
+            Haptics.selection()
+        }
+    }
+
+    private func hasKnownFollowState(_ u: UnifiedUser) -> Bool { u.isFollowing != nil }
+
+    private func showToast(_ text: String) {
+        withAnimation { toastText = text }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+            withAnimation { toastText = nil }
+        }
+    }
+
+    private func canFollow(_ u: UnifiedUser) -> Bool {
+        switch u.network {
+        case .bluesky:
+            return session.isBlueskySignedIn && (session.blueskyClient != nil)
+        case .mastodon(let instance):
+            if let c = session.mastodonClient, session.isMastodonSignedIn {
+                return c.baseURL.host == instance
+            }
+            return false
+        }
+    }
+
+    private func isViewingSelf(_ u: UnifiedUser) -> Bool {
+        switch u.network {
+        case .bluesky:
+            if let did = session.blueskyDid {
+                // u.id is like "bsky:<did>"
+                if let userDid = u.id.split(separator: ":", maxSplits: 1).last, userDid == Substring(did) { return true }
+            }
+            if let myHandle = session.signedInHandleBluesky, myHandle == u.handle { return true }
+            return false
+        case .mastodon(let instance):
+            // Hide if we know our own handle and instance matches
+            if let myHandle = session.signedInHandleMastodon,
+               let c = session.mastodonClient, c.baseURL.host == instance {
+                return myHandle == u.handle || "@\(myHandle)" == u.handle
+            }
+            return false
+        }
     }
 }

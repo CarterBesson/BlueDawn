@@ -1,66 +1,87 @@
 import SwiftUI
 
 struct SettingsView: View {
+    // Landing page for app settings
     @Environment(SessionStore.self) private var session
-    @State private var confirmMastoSignOut = false
-    @State private var confirmBskySignOut = false
 
     var body: some View {
         NavigationStack {
             List {
-                Section("Accounts") {
-                    HStack {
-                        Label("Mastodon", systemImage: "dot.radiowaves.left.and.right")
-                        Spacer()
-                        statusBadge(session.mastodonClient != nil)
-                    }
-                    NavigationLink("Mastodon Login…") { MastodonLoginView() }
-                    if session.mastodonClient != nil {
-                        Button("Sign out of Mastodon", role: .destructive) { confirmMastoSignOut = true }
+                Section("General") {
+                    Toggle(isOn: Binding(get: { session.openLinksInApp }, set: { session.openLinksInApp = $0 })) {
+                        Label("Open links in in-app browser", systemImage: "safari")
                     }
 
-                    HStack {
-                        Label("Bluesky", systemImage: "cloud")
-                        Spacer()
-                        statusBadge(session.blueskyClient != nil)
+                    NavigationLink {
+                        SettingsAccountsView()
+                    } label: {
+                        Label("Accounts", systemImage: "person.2")
                     }
-                    NavigationLink("Bluesky Login…") { BlueskyLoginView() }
-                    if session.blueskyClient != nil {
-                        Button("Sign out of Bluesky", role: .destructive) { confirmBskySignOut = true }
+
+                    NavigationLink {
+                        SettingsSwipeActionsView()
+                    } label: {
+                        Label("Swipe Actions", systemImage: "hand.draw")
+                    }
+                }
+
+                Section("Appearance") {
+                    // Preview of the current avatar selection
+                    HStack(spacing: 16) {
+                        AvatarCircle(
+                            handle: session.selectedHandle ?? "?",
+                            url: session.selectedAvatarURL,
+                            size: 48
+                        )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Profile image preview")
+                                .font(.headline)
+                            Text("Source: \(session.avatarSourcePreference.label)\(session.selectedHandle.map { "  •  @\($0)" } ?? "")")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    // Choose which account provides the avatar, disabling options if not signed in
+                    Picker("Profile image source", selection: Binding(get: { session.avatarSourcePreference }, set: { session.avatarSourcePreference = $0 })) {
+                        Text(SessionStore.AvatarSource.auto.label).tag(SessionStore.AvatarSource.auto)
+                        Text(SessionStore.AvatarSource.bluesky.label)
+                            .tag(SessionStore.AvatarSource.bluesky)
+                            .disabled(!session.isBlueskySignedIn)
+                        Text(SessionStore.AvatarSource.mastodon.label)
+                            .tag(SessionStore.AvatarSource.mastodon)
+                            .disabled(!session.isMastodonSignedIn)
+                    }
+                    .pickerStyle(.menu)
+                    .accessibilityLabel("Profile image source")
+
+                    if !session.isBlueskySignedIn {
+                        Text("Bluesky avatar unavailable: not signed in.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    if !session.isMastodonSignedIn {
+                        Text("Mastodon avatar unavailable: not signed in.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("Playback") {
+                    Toggle(isOn: Binding(get: { session.videoStartMuted }, set: { session.videoStartMuted = $0 })) {
+                        Label("Start videos muted", systemImage: "speaker.slash")
+                    }
+
+                    Toggle(isOn: Binding(get: { session.videoAutoplay }, set: { session.videoAutoplay = $0 })) {
+                        Label("Autoplay videos", systemImage: "play.circle")
+                    }
+
+                    Toggle(isOn: Binding(get: { session.videoLoop }, set: { session.videoLoop = $0 })) {
+                        Label("Loop videos & GIFs", systemImage: "repeat")
                     }
                 }
             }
             .navigationTitle("Settings")
         }
-        .alert("Sign out of Mastodon?", isPresented: $confirmMastoSignOut) {
-            Button("Cancel", role: .cancel) {}
-            Button("Sign out", role: .destructive) {
-                session.mastodonClient = nil
-                session.isMastodonSignedIn = false
-                session.signedInHandleMastodon = nil
-            }
-        } message: {
-            Text("This will remove your Mastodon token from this device.")
-        }
-        .alert("Sign out of Bluesky?", isPresented: $confirmBskySignOut) {
-            Button("Cancel", role: .cancel) {}
-            Button("Sign out", role: .destructive) {
-                session.blueskyClient = nil
-                session.isBlueskySignedIn = false
-                session.signedInHandleBluesky = nil
-            }
-        } message: {
-            Text("This will remove your Bluesky token from this device.")
-        }
     }
-
-    @ViewBuilder
-    private func statusBadge(_ connected: Bool) -> some View {
-        if connected {
-            Text("Connected").font(.caption).foregroundStyle(.green)
-        } else {
-            Text("Not connected").font(.caption).foregroundStyle(.secondary)
-        }
-    }
-    
 }
