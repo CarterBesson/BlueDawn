@@ -2,7 +2,16 @@ import SwiftUI
 
 struct ProfileView: View {
     @Environment(SessionStore.self) private var session
-    @State var viewModel: ProfileViewModel
+    let network: Network
+    let handle: String
+
+    @State private var user: UnifiedUser? = nil
+    @State private var posts: [UnifiedPost] = []
+    @State private var isLoading = false
+    @State private var isLoadingMore = false
+    @State private var error: String? = nil
+    @State private var nextCursor: String? = nil
+
     // For opening booster/reposter profiles from the banner
     @State private var profileTarget: ProfileTarget? = nil
     @State private var pushProfile: Bool = false
@@ -14,19 +23,15 @@ struct ProfileView: View {
     @State private var toastText: String? = nil
     private struct ProfileTarget: Identifiable { let id = UUID(); let network: Network; let handle: String }
 
-    init(network: Network, handle: String, session: SessionStore) {
-        _viewModel = State(initialValue: ProfileViewModel(session: session, network: network, handle: handle))
-    }
-
     var body: some View {
         List {
-            if let u = viewModel.user {
+            if let u = user {
                 header(user: u)
             } else {
                 HStack { Spacer(); ProgressView(); Spacer() }
             }
 
-            ForEach(viewModel.posts, id: \.id) { post in
+            ForEach(posts, id: \.id) { post in
                 // Programmatic navigation to avoid conflicts with image taps
                 PostRow(
                     post: post,
@@ -45,14 +50,14 @@ struct ProfileView: View {
                 .onTapGesture { postSelection = post }
                 .listRowSeparator(.hidden)
                 .onAppear {
-                    if let idx = viewModel.posts.firstIndex(where: { $0.id == post.id }),
-                       idx >= viewModel.posts.count - 5 {
-                        Task { await viewModel.loadMore() }
+                    if let idx = posts.firstIndex(where: { $0.id == post.id }),
+                       idx >= posts.count - 5 {
+                        Task { await loadMore() }
                     }
                 }
             }
 
-            if viewModel.isLoadingMore {
+            if isLoadingMore {
                 HStack { Spacer(); ProgressView(); Spacer() }
                     .listRowSeparator(.hidden)
             }
@@ -105,19 +110,19 @@ struct ProfileView: View {
         })
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            await viewModel.load()
-            if let u = viewModel.user, let f = u.isFollowing { isFollowing = f }
+            await load()
+            if let u = user, let f = u.isFollowing { isFollowing = f }
         }
-        .alert("Error", isPresented: .constant(viewModel.error != nil)) {
-            Button("OK") { viewModel.error = nil }
-        } message: { Text(viewModel.error ?? "") }
+        .alert("Error", isPresented: .constant(error != nil)) {
+            Button("OK") { error = nil }
+        } message: { Text(error ?? "") }
         .navigationDestination(item: $postSelection) {
-            PostDetailView(post: $0, viewModel: ThreadViewModel(session: session, root: $0))
+            PostDetailView(post: $0)
         }
         .navigationDestination(isPresented: $pushProfile) {
             Group {
                 if let target = profileTarget {
-                    ProfileView(network: target.network, handle: target.handle, session: session)
+                    ProfileView(network: target.network, handle: target.handle)
                 } else {
                     EmptyView()
                 }
@@ -173,6 +178,7 @@ struct ProfileView: View {
         if session.openLinksInApp { safariURL = url }
         #endif
     }
+
     @ViewBuilder
     private func header(user u: UnifiedUser) -> some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -260,6 +266,52 @@ private extension View {
 
 extension ProfileView {
     @MainActor
+    private func load() async {
+        guard !isLoading else { return }
+        isLoading = true
+        error = nil
+        defer { isLoading = false }
+        do {
+            let client = client()
+            self.user = try await client.fetchUserProfile(handle: handle)
+            let (p, cursor) = try await client.fetchAuthorFeed(handle: handle, cursor: nil)
+            self.posts = p
+            self.nextCursor = cursor
+        } catch { self.error = error.localizedDescription }
+    }
+
+    @MainActor
+    private func loadMore() async {
+        guard !isLoadingMore, let cursor = nextCursor else { return }
+        isLoadingMore = true
+        error = nil
+        defer { isLoadingMore = false }
+        do {
+            let (more, next) = try await client().fetchAuthorFeed(handle: handle, cursor: cursor)
+            // de-dupe by id
+            var seen = Set(posts.map { $0.id })
+            let unique = more.filter { seen.insert($0.id).inserted }
+            self.posts.append(contentsOf: unique)
+            self.nextCursor = next
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func client() -> SocialClient {
+        switch network {
+        case .bluesky:
+            precondition(session.blueskyClient != nil, "Not signed into Bluesky")
+            return session.blueskyClient!
+        case .mastodon(let instance):
+            if let c = session.mastodonClient, c.baseURL.host == instance {
+                return c
+            }
+            // Fallback public client for cross-instance profiles (no auth)
+            let url = URL(string: "https://\(instance)")!
+            return MastodonClient(baseURL: url, accessToken: "")
+        }
+    }
+
+    @MainActor
     private func handleToggleFollow(_ u: UnifiedUser) async {
         guard !isTogglingFollow else { return }
         guard canFollow(u) else { return }
@@ -273,17 +325,17 @@ extension ProfileView {
             case .bluesky:
                 guard let client = await session.blueskyClientEnsuringFreshToken() else { throw URLError(.userAuthenticationRequired) }
                 if currentlyFollowing {
-                    if let rkey = viewModel.user?.bskyFollowRkey { try await client.unfollowUser(rkey: rkey) }
-                    viewModel.user?.isFollowing = false
-                    viewModel.user?.bskyFollowRkey = nil
+                    if let rkey = user?.bskyFollowRkey { try await client.unfollowUser(rkey: rkey) }
+                    user?.isFollowing = false
+                    user?.bskyFollowRkey = nil
                     showToast("Unfollowed @\(u.handle)")
                     Haptics.selection()
                 } else {
                     // Extract DID from UnifiedUser.id ("bsky:<did>")
                     let did = u.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
                     let rkey = try await client.followUser(did: did)
-                    viewModel.user?.isFollowing = true
-                    viewModel.user?.bskyFollowRkey = rkey
+                    user?.isFollowing = true
+                    user?.bskyFollowRkey = rkey
                     showToast("Followed @\(u.handle)")
                     Haptics.selection()
                 }
@@ -293,10 +345,10 @@ extension ProfileView {
                     // Extract account ID from UnifiedUser.id ("mastodon:<id>")
                     let id = u.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? ""
                     if currentlyFollowing {
-                        try await client.unfollowUser(id: id); viewModel.user?.isFollowing = false
+                        try await client.unfollowUser(id: id); user?.isFollowing = false
                         showToast("Unfollowed @\(u.handle)"); Haptics.selection()
                     } else {
-                        try await client.followUser(id: id); viewModel.user?.isFollowing = true
+                        try await client.followUser(id: id); user?.isFollowing = true
                         showToast("Followed @\(u.handle)"); Haptics.selection()
                     }
                 } else {
@@ -306,7 +358,7 @@ extension ProfileView {
         } catch {
             // Revert on failure
             withAnimation { isFollowing = currentlyFollowing }
-            viewModel.error = error.localizedDescription
+            self.error = error.localizedDescription
             Haptics.selection()
         }
     }
