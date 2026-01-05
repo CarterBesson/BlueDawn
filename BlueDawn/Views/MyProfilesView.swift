@@ -48,14 +48,14 @@ struct MyProfilesView: View {
                 switch selection {
                 case .bluesky:
                     if let handle = session.signedInHandleBluesky {
-                        ProfileView(network: .bluesky, handle: handle, session: session)
+                        ProfileView(network: .bluesky, handle: handle)
                     } else {
                         missingHandleView("Bluesky")
                     }
                 case .mastodon:
                     if let handle = session.signedInHandleMastodon, let client = session.mastodonClient {
                         let base = client.baseURL.host ?? client.baseURL.absoluteString
-                        ProfileView(network: .mastodon(instance: base), handle: handle, session: session)
+                        ProfileView(network: .mastodon(instance: base), handle: handle)
                     } else {
                         missingHandleView("Mastodon")
                     }

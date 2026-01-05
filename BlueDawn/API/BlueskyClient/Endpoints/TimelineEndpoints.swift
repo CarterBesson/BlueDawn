@@ -21,14 +21,17 @@ extension BlueskyClient {
         let mapped = tl.feed.compactMap { feedItem -> UnifiedPost? in
             let p = feedItem.post
             guard let rec = p.record, rec.type == "app.bsky.feed.post" else { return nil }
-            if let reply = feedItem.reply, let parentAuthor = reply.parent?.author {
-                let followedViaViewer = (parentAuthor.viewer?.following != nil)
-                let followedViaSet = followingDIDs.contains(parentAuthor.did)
-                if !(followedViaViewer || followedViaSet) { return nil }
-            } else if feedItem.reply != nil {
-                return nil
-            }
             let isRepost = (feedItem.reason?.type == "app.bsky.feed.defs#reasonRepost")
+            if !isRepost {
+                if let reply = feedItem.reply, let parentAuthor = reply.parent?.author {
+                    let followedViaViewer = (parentAuthor.viewer?.following != nil)
+                    let followedViaSet = followingDIDs.contains(parentAuthor.did)
+                    if !(followedViaViewer || followedViaSet) { return nil }
+                } else if feedItem.reply != nil {
+                    // Reply context present but no parent author -> drop it
+                    return nil
+                }
+            }
             let boostedHandle = isRepost ? feedItem.reason?.by?.handle : nil
             let boostedName   = isRepost ? feedItem.reason?.by?.displayName : nil
             return mapPostToUnified(p, isRepost: isRepost, boostedByHandle: boostedHandle, boostedByDisplayName: boostedName)
