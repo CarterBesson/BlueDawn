@@ -3,7 +3,12 @@ import SwiftUI
 struct PostDetailView: View {
     @Environment(SessionStore.self) private var session
     let post: UnifiedPost
-    @State var viewModel: ThreadViewModel
+
+    @State private var items: [ThreadItem] = []
+    @State private var ancestors: [UnifiedPost] = []
+    @State private var isLoading = false
+    @State private var error: String? = nil
+
     // Shared interaction state is kept in SessionStore; no local state needed
     @State private var initialPosition: String? = "focusedPost"
     @State private var imageViewer: ImageViewerState? = nil
@@ -17,28 +22,23 @@ struct PostDetailView: View {
         let handle: String
     }
 
-    init(post: UnifiedPost, viewModel: ThreadViewModel) {
-        self.post = post
-        _viewModel = State(initialValue: viewModel)
-    }
-
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 16) {
 
                 // Ancestor context ABOVE the focused post
-                if !viewModel.ancestors.isEmpty {
+                if !ancestors.isEmpty {
                     VStack(alignment: .leading, spacing: 0) {
                         Text("In reply to")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .padding(.bottom, 8)
 
-                        ForEach(viewModel.ancestors, id: \.id) { anc in
+                        ForEach(ancestors, id: \.id) { anc in
                             HStack(alignment: .top, spacing: 12) {
                                 // Avatar → Profile
                                 NavigationLink {
-                                    ProfileView(network: anc.network, handle: anc.authorHandle, session: session)
+                                    ProfileView(network: anc.network, handle: anc.authorHandle)
                                 } label: {
                                     Group {
                                         if let url = anc.authorAvatarURL {
@@ -57,22 +57,22 @@ struct PostDetailView: View {
                                 }
                                 .buttonStyle(.plain)
 
-                        // Content → programmatic navigation to preserve nested interactions
-                        PostRow(
-                            post: anc,
-                            showAvatar: false,
-                            onOpenProfile: { net, handle in
-                                profileRoute = ProfileRoute(network: net, handle: handle)
-                            },
-                            onOpenPost: { p in
-                                postSelection = p
-                            },
-                            onTapImage: { tappedPost, idx in
-                                imageViewer = ImageViewerState(post: tappedPost, index: idx)
-                            }
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture { postSelection = anc }
+                                // Content → programmatic navigation to preserve nested interactions
+                                PostRow(
+                                    post: anc,
+                                    showAvatar: false,
+                                    onOpenProfile: { net, handle in
+                                        profileRoute = ProfileRoute(network: net, handle: handle)
+                                    },
+                                    onOpenPost: { p in
+                                        postSelection = p
+                                    },
+                                    onTapImage: { tappedPost, idx in
+                                        imageViewer = ImageViewerState(post: tappedPost, index: idx)
+                                    }
+                                )
+                                .contentShape(Rectangle())
+                                .onTapGesture { postSelection = anc }
 
                                 Spacer(minLength: 0)
                             }
@@ -115,7 +115,7 @@ struct PostDetailView: View {
 
                 Divider().padding(.vertical, 6)
                 repliesSection
-                    .animation(nil, value: viewModel.items.count)
+                    .animation(nil, value: items.count)
                 }
                 .padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -186,13 +186,13 @@ struct PostDetailView: View {
             }
             #endif
             .task {
-                await viewModel.load()
+                await loadThread()
             }
             .navigationDestination(item: $profileRoute) { route in
-                ProfileView(network: route.network, handle: route.handle, session: session)
+                ProfileView(network: route.network, handle: route.handle)
             }
             .navigationDestination(item: $postSelection) { p in
-                PostDetailView(post: p, viewModel: ThreadViewModel(session: session, root: p))
+                PostDetailView(post: p)
             }
     }
 
@@ -201,7 +201,7 @@ struct PostDetailView: View {
         HStack(alignment: .top, spacing: 12) {
             // Avatar → Profile (tappable)
             NavigationLink {
-                ProfileView(network: post.network, handle: post.authorHandle, session: session)
+                ProfileView(network: post.network, handle: post.authorHandle)
             } label: {
                 avatar
             }
@@ -332,16 +332,16 @@ struct PostDetailView: View {
                 .font(.headline)
                 .padding(.bottom, 8)
 
-            if viewModel.isLoading {
+            if isLoading {
                 HStack { Spacer(); ProgressView(); Spacer() }
                     .padding(.vertical, 12)
             }
 
-            ForEach(viewModel.items) { item in
+            ForEach(items) { item in
                 HStack(alignment: .top, spacing: 10) {
                     // Avatar → Profile
                     NavigationLink {
-                        ProfileView(network: item.post.network, handle: item.post.authorHandle, session: session)
+                        ProfileView(network: item.post.network, handle: item.post.authorHandle)
                     } label: {
                         Group {
                             if let url = item.post.authorAvatarURL {
@@ -396,7 +396,7 @@ struct PostDetailView: View {
                 Divider().padding(.leading, CGFloat(item.depth) * 16)
             }
 
-            if let err = viewModel.error {
+            if let err = error {
                 Text(err).font(.footnote).foregroundStyle(.red)
             }
         }
@@ -632,6 +632,54 @@ struct PostDetailView: View {
         #if canImport(SafariServices) && canImport(UIKit)
         if session.openLinksInApp { safariURL = originalURL }
         #endif
+    }
+}
+
+private extension PostDetailView {
+    @MainActor
+    func loadThread() async {
+        isLoading = true
+        error = nil
+        defer { isLoading = false }
+
+        do {
+            if case .bluesky = post.network {
+                await session.ensureValidBlueskyAccess()
+            }
+
+            let client: SocialClient? = clientFor(post)
+
+            guard let client else {
+                self.items = []
+                self.ancestors = []
+                return
+            }
+
+            async let repliesTask: [ThreadItem] = client.fetchThread(root: post)
+            async let ancestorsTask: [UnifiedPost] = client.fetchAncestors(root: post)
+
+            let parents = try await ancestorsTask
+            self.ancestors = parents
+
+            let replies = try await repliesTask
+            self.items = replies
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    func clientFor(_ post: UnifiedPost) -> SocialClient? {
+        switch post.network {
+        case .bluesky:
+            return session.blueskyClient
+        case .mastodon(let instance):
+            if let c = session.mastodonClient, c.baseURL.host == instance {
+                return c
+            }
+            // Fallback to a public client for the post's instance
+            guard let url = URL(string: "https://\(instance)") else { return nil }
+            return MastodonClient(baseURL: url, accessToken: "")
+        }
     }
 }
 
