@@ -3,10 +3,14 @@ import SwiftUI
 struct LoginView: View {
     @Environment(SessionStore.self) private var session
     @State private var instanceDomain: String = ""
-    @State private var mastodonToken: String = ""
+    @State private var mastodonError: String?
+    @State private var isMastodonSigningIn = false
+    @State private var oauthCoordinator = MastodonOAuthCoordinator()
     @State private var bskyIdentifier: String = ""   // email or handle (e.g., you.bsky.social)
     @State private var bskyAppPassword: String = ""  // app password from Bluesky settings
     @State private var bskyService: String = "https://bsky.social" // optional PDS/service base
+    @State private var bskyError: String?
+    @State private var isBlueskySigningIn = false
 
     private var fieldBackground: Color { Color.secondary.opacity(0.12) }
 
@@ -15,7 +19,7 @@ struct LoginView: View {
             VStack(spacing: 24) {
                 Text("Sign in to your networks")
                     .font(.title2.bold())
-                
+
                 // Mastodon
                 VStack(alignment: .leading, spacing: 12) {
                     Label("Mastodon", systemImage: "dot.radiowaves.left.and.right")
@@ -30,22 +34,31 @@ struct LoginView: View {
                         .padding(12)
                         .background(fieldBackground)
                         .cornerRadius(12)
-                    SecureField("Personal access token (temporary)", text: $mastodonToken)
-#if canImport(UIKit)
-                        .autocapitalization(.none)
-                        .disableAutocorrection(true)
-#endif
-                        .padding(12)
-                        .background(fieldBackground)
-                        .cornerRadius(12)
+                    Text("Use Mastodon to authorize BlueDawn. Your token is stored securely in the keychain.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                     Button {
                         Task { await signInMastodon() }
                     } label: {
-                        Label("Sign in to Mastodon", systemImage: "lock.fill")
+                        if isMastodonSigningIn {
+                            HStack {
+                                ProgressView()
+                                Text("Signing in…")
+                            }
+                        } else {
+                            Label("Sign in to Mastodon", systemImage: "lock.fill")
+                        }
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(instanceDomain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isMastodonSigningIn)
+
+                    if let mastodonError {
+                        Text(mastodonError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
                 }
-                
+
                 // Bluesky
                 VStack(alignment: .leading, spacing: 12) {
                     Label("Bluesky", systemImage: "cloud")
@@ -54,6 +67,7 @@ struct LoginView: View {
 #if canImport(UIKit)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                        .textContentType(.username)
 #endif
                         .padding(12)
                         .background(fieldBackground)
@@ -63,6 +77,7 @@ struct LoginView: View {
 #if canImport(UIKit)
                         .autocapitalization(.none)
                         .disableAutocorrection(true)
+                        .textContentType(.password)
 #endif
                         .padding(12)
                         .background(fieldBackground)
@@ -81,29 +96,57 @@ struct LoginView: View {
                     Button {
                         Task { await signInBluesky() }
                     } label: {
-                        Label("Sign in to Bluesky", systemImage: "lock.fill")
+                        if isBlueskySigningIn {
+                            HStack {
+                                ProgressView()
+                                Text("Signing in…")
+                            }
+                        } else {
+                            Label("Sign in to Bluesky", systemImage: "lock.fill")
+                        }
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(bskyIdentifier.isEmpty || bskyAppPassword.isEmpty || isBlueskySigningIn)
+
+                    if let bskyError {
+                        Text(bskyError)
+                            .font(.footnote)
+                            .foregroundStyle(.red)
+                    }
                 }
-                
+
                 Spacer()
             }
             .padding()
             .navigationTitle("BlueDawn")
         }
     }
-    
+
     @MainActor private func signInMastodon() async {
+        mastodonError = nil
         let trimmed = instanceDomain.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !mastodonToken.isEmpty,
-              let url = URL(string: "https://\(trimmed)") else { return }
-        session.mastodonClient = MastodonClient(baseURL: url, accessToken: mastodonToken)
-        session.isMastodonSignedIn = true
-        mastodonToken = ""
+        guard let instanceURL = normalizeInstanceURL(trimmed) else {
+            mastodonError = MastodonOAuthCoordinator.OAuthError.invalidInstance.errorDescription
+            return
+        }
+
+        isMastodonSigningIn = true
+        defer { isMastodonSigningIn = false }
+
+        do {
+            let token = try await oauthCoordinator.authenticate(instanceURL: instanceURL)
+            session.setMastodonSession(baseURL: instanceURL, accessToken: token)
+        } catch {
+            mastodonError = (error as? LocalizedError)?.errorDescription ?? "Unable to sign in to Mastodon."
+        }
     }
-    
+
     @MainActor
     private func signInBluesky() async {
+        bskyError = nil
+        isBlueskySigningIn = true
+        defer { isBlueskySigningIn = false }
+
         let service = bskyService.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "https://bsky.social"
             : bskyService.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -112,7 +155,10 @@ struct LoginView: View {
             let serviceURL = URL(string: service),
             !bskyIdentifier.isEmpty,
             !bskyAppPassword.isEmpty
-        else { return }
+        else {
+            bskyError = "Enter your handle/email and app password."
+            return
+        }
 
         struct CreateSessionReq: Encodable {
             let identifier: String
@@ -136,6 +182,7 @@ struct LoginView: View {
 
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                bskyError = "Unable to sign in. Check your credentials."
                 return
             }
 
@@ -147,7 +194,18 @@ struct LoginView: View {
 
             bskyAppPassword = ""
         } catch {
+            bskyError = "Unable to sign in. Check your credentials and try again."
         }
+    }
+
+    private func normalizeInstanceURL(_ input: String) -> URL? {
+        guard !input.isEmpty else { return nil }
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let urlString = trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://")
+            ? trimmed
+            : "https://\(trimmed)"
+        guard let url = URL(string: urlString), url.scheme == "https", url.host != nil else { return nil }
+        return url
     }
 }
 
